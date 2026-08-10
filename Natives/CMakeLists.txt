@@ -52,6 +52,22 @@ set(CMAKE_FRAMEWORK_PATH "${CMAKE_CURRENT_LIST_DIR}/resources/Frameworks")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rpath @executable_path/Frameworks -rpath @loader_path/Frameworks")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -rpath @executable_path/Frameworks -rpath @loader_path/Frameworks")
 
+# Optional Mithril DirectMetal renderer. The producer build is responsible for
+# validating that this is an iPhoneOS/arm64 dylib; Amethyst only stages the
+# exact artifact into Natives/build so the existing payload recipe bundles it.
+set(MITHRIL_DYLIB "" CACHE FILEPATH "Path to a validated libmithril.dylib")
+if(NOT MITHRIL_DYLIB AND DEFINED ENV{MITHRIL_DYLIB})
+  set(MITHRIL_DYLIB "$ENV{MITHRIL_DYLIB}")
+endif()
+if(MITHRIL_DYLIB)
+  get_filename_component(MITHRIL_DYLIB "${MITHRIL_DYLIB}" ABSOLUTE)
+  if(NOT EXISTS "${MITHRIL_DYLIB}")
+    message(FATAL_ERROR "MITHRIL_DYLIB does not exist: ${MITHRIL_DYLIB}")
+  endif()
+  configure_file("${MITHRIL_DYLIB}" "${CMAKE_BINARY_DIR}/libmithril.dylib" COPYONLY)
+  message(STATUS "Staged Mithril DirectMetal renderer: ${MITHRIL_DYLIB}")
+endif()
+
 # ANGLE wrapper for 1.17+
 add_library(tinygl4angle SHARED
   external/gl4es/string_utils.c
