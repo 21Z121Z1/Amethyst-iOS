@@ -1,6 +1,7 @@
 /packages
 /artifacts
 /build
+/.deps
 /JavaApp/.gradle
 /JavaApp/build
 /JavaApp/local_out
