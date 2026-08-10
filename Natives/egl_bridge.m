@@ -60,15 +60,31 @@ int pojavInitOpenGL() {
         renderer = @ RENDERER_NAME_MOBILEGLUES;
         setenv("POJAV_RENDERER", renderer.UTF8String, 1);
         set_gl_bridge_tbl();
-    } else if ([renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE]) {
+    } else if ([renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE] ||
+               [renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
+        // ANGLE and Mithril both expose a desktop-OpenGL EGL contract. Mithril
+        // additionally requires its own EGL entry points so that the native
+        // CAMetalLayer reaches its DirectMetal backend.
         set_gl_bridge_tbl();
     } else if ([renderer hasPrefix:@"libOSMesa"]) {
         setenv("GALLIUM_DRIVER","zink",1);
         set_osm_bridge_tbl();
     }
+
+    if (!br_init) {
+        NSLog(@"Renderer: unsupported renderer '%@'", renderer);
+        return 1;
+    }
+
     JNI_LWJGL_changeRenderer(renderer.UTF8String);
-    // Preload renderer library
-    dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, RTLD_GLOBAL);
+
+    // Preload the renderer before the bridge resolves its EGL entry points.
+    NSString *rendererPath = [NSString stringWithFormat:@"@rpath/%@", renderer];
+    void *rendererHandle = dlopen(rendererPath.UTF8String, RTLD_GLOBAL);
+    if (!rendererHandle) {
+        NSLog(@"Renderer: failed to load %@: %s", rendererPath, dlerror());
+        return 1;
+    }
 
     return !br_init();
     //return 0;
@@ -109,8 +125,8 @@ void* pojavCreateContext(basic_render_window_t* contextSrc) {
 
     static BOOL inited = NO;
     if (!inited) {
+        if (pojavInitOpenGL() != 0) return NULL;
         inited = YES;
-        pojavInitOpenGL();
     }
 
     return br_init_context(contextSrc);

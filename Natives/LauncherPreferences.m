@@ -133,6 +133,12 @@ NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion) {
 }
 
 #pragma mark Renderer
+static BOOL isBundledRenderer(NSString *renderer) {
+    NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:
+                      [@"Frameworks/" stringByAppendingString:renderer]];
+    return [NSFileManager.defaultManager fileExistsAtPath:path];
+}
+
 NSArray* getRendererKeys(BOOL containsDefault) {
     NSMutableArray *array = @[
         @"auto",
@@ -141,6 +147,12 @@ NSArray* getRendererKeys(BOOL containsDefault) {
         @ RENDERER_NAME_MOBILEGLUES,
         @ RENDERER_NAME_VK_ZINK
     ].mutableCopy;
+
+    // Mithril is an optional renderer during the integration phase. Only
+    // expose it in profiles when the matching iOS dylib is actually packaged.
+    if (isBundledRenderer(@ RENDERER_NAME_MITHRIL)) {
+        [array addObject:@ RENDERER_NAME_MITHRIL];
+    }
 
     if (containsDefault) {
         [array insertObject:@"(default)" atIndex:0];
@@ -159,6 +171,10 @@ NSArray* getRendererNames(BOOL containsDefault) {
         localize(@"preference.title.renderer.debug.mg", nil),
         localize(@"preference.title.renderer.debug.zink", nil)
     ].mutableCopy;
+
+    if (isBundledRenderer(@ RENDERER_NAME_MITHRIL)) {
+        [array addObject:@"Mithril (Direct Metal)"];
+    }
 
     if (containsDefault) {
         [array insertObject:@"(default)" atIndex:0];

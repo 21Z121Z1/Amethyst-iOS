@@ -10,9 +10,32 @@
 static EGLDisplay g_EglDisplay;
 static egl_library handle;
 
-void dlsym_EGL() {
-    void* dl_handle = dlopen("@rpath/libtinygl4angle.dylib", RTLD_GLOBAL);
-    NSCAssert(dl_handle, @(dlerror()));
+static BOOL rendererUsesDesktopGL(NSString *renderer) {
+    return [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE] ||
+           [renderer isEqualToString:@ RENDERER_NAME_MITHRIL];
+}
+
+static NSString *eglProviderForRenderer(NSString *renderer) {
+    // GL4ES and MobileGlues keep using TinyGL/ANGLE for EGL. Mithril owns its
+    // EGL lifecycle because eglCreateWindowSurface must receive the real
+    // CAMetalLayer and eglSwapBuffers must route back into DirectMetal.
+    if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
+        return renderer;
+    }
+    return @ RENDERER_NAME_MTL_ANGLE;
+}
+
+static bool dlsym_EGL() {
+    NSString *renderer = NSProcessInfo.processInfo.environment[@"POJAV_RENDERER"];
+    NSString *provider = eglProviderForRenderer(renderer);
+    NSString *providerPath = [NSString stringWithFormat:@"@rpath/%@", provider];
+    void* dl_handle = dlopen(providerPath.UTF8String, RTLD_GLOBAL);
+    if (!dl_handle) {
+        NSLog(@"EGLBridge: failed to load EGL provider %@: %s", providerPath, dlerror());
+        return false;
+    }
+
+    handle = (egl_library){0};
     handle.eglBindAPI = dlsym(dl_handle, "eglBindAPI");
     handle.eglChooseConfig = dlsym(dl_handle, "eglChooseConfig");
     handle.eglCreateContext = dlsym(dl_handle, "eglCreateContext");
@@ -20,21 +43,40 @@ void dlsym_EGL() {
     handle.eglDestroyContext = dlsym(dl_handle, "eglDestroyContext");
     handle.eglDestroySurface = dlsym(dl_handle, "eglDestroySurface");
     handle.eglGetConfigAttrib = dlsym(dl_handle, "eglGetConfigAttrib");
+    handle.eglGetConfigs = dlsym(dl_handle, "eglGetConfigs");
     handle.eglGetCurrentContext = dlsym(dl_handle, "eglGetCurrentContext");
+    handle.eglGetCurrentSurface = dlsym(dl_handle, "eglGetCurrentSurface");
     handle.eglGetDisplay = dlsym(dl_handle, "eglGetDisplay");
     handle.eglGetError = dlsym(dl_handle, "eglGetError");
     handle.eglGetPlatformDisplay = dlsym(dl_handle, "eglGetPlatformDisplay");
     handle.eglInitialize = dlsym(dl_handle, "eglInitialize");
     handle.eglMakeCurrent = dlsym(dl_handle, "eglMakeCurrent");
-    handle.eglSwapBuffers = dlsym(dl_handle, "eglSwapBuffers");
+    handle.eglQueryString = dlsym(dl_handle, "eglQueryString");
     handle.eglReleaseThread = dlsym(dl_handle, "eglReleaseThread");
+    handle.eglSwapBuffers = dlsym(dl_handle, "eglSwapBuffers");
     handle.eglSwapInterval = dlsym(dl_handle, "eglSwapInterval");
     handle.eglTerminate = dlsym(dl_handle, "eglTerminate");
-    handle.eglGetCurrentSurface = dlsym(dl_handle, "eglGetCurrentSurface");
+
+    if (!handle.eglBindAPI || !handle.eglChooseConfig ||
+        !handle.eglCreateContext || !handle.eglCreateWindowSurface ||
+        !handle.eglDestroyContext || !handle.eglDestroySurface ||
+        !handle.eglGetConfigAttrib || !handle.eglGetCurrentContext ||
+        !handle.eglGetCurrentSurface || !handle.eglGetDisplay ||
+        !handle.eglGetError || !handle.eglGetPlatformDisplay ||
+        !handle.eglInitialize || !handle.eglMakeCurrent ||
+        !handle.eglReleaseThread || !handle.eglSwapBuffers ||
+        !handle.eglSwapInterval || !handle.eglTerminate) {
+        NSLog(@"EGLBridge: EGL provider %@ does not satisfy the required contract", provider);
+        return false;
+    }
+
+    NSDebugLog(@"EGLBridge: using %@ for EGL (%@)", provider,
+               rendererUsesDesktopGL(renderer) ? @"desktop OpenGL" : @"OpenGL ES");
+    return true;
 }
 
 static bool gl_init() {
-    dlsym_EGL();
+    if (!dlsym_EGL()) return false;
 
     g_EglDisplay = handle.eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (g_EglDisplay == EGL_NO_DISPLAY) {
@@ -52,7 +94,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     gl_render_window_t* bundle = calloc(1, sizeof(gl_render_window_t));
 
     NSString *renderer = NSProcessInfo.processInfo.environment[@"POJAV_RENDERER"];
-    BOOL angleDesktopGL = [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE];
+    BOOL desktopGL = rendererUsesDesktopGL(renderer);
 
     const EGLint attribs[] = {
         EGL_RED_SIZE, 8,
@@ -61,7 +103,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         EGL_ALPHA_SIZE, 8,
         EGL_DEPTH_SIZE, 24,
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT|EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, angleDesktopGL ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT,
+        EGL_RENDERABLE_TYPE, desktopGL ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT,
         EGL_NONE
     };
 
@@ -72,8 +114,11 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         free(bundle);
         return NULL;
     }
-    assert(bundle->config);
-    assert(num_configs > 0);
+    if (!bundle->config || num_configs <= 0) {
+        NSDebugLog(@"EGLBridge: EGL provider returned no matching configuration");
+        free(bundle);
+        return NULL;
+    }
 
     if (!handle.eglGetConfigAttrib(g_EglDisplay, bundle->config, EGL_NATIVE_VISUAL_ID, &vid)) {
         NSDebugLog(@"EGLBridge: Error eglGetConfigAttrib() failed: 0x%x", handle.eglGetError());
@@ -82,14 +127,18 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     }
 
     EGLBoolean bindResult;
-    if (angleDesktopGL) {
+    if (desktopGL) {
         NSDebugLog(@"EGLBridge: Binding to desktop OpenGL");
         bindResult = handle.eglBindAPI(EGL_OPENGL_API);
     } else {
         NSDebugLog(@"EGLBridge: Binding to OpenGL ES");
         bindResult = handle.eglBindAPI(EGL_OPENGL_ES_API);
     }
-    if (!bindResult) NSDebugLog(@"EGLBridge: bind failed: %p\n", handle.eglGetError());
+    if (!bindResult) {
+        NSDebugLog(@"EGLBridge: eglBindAPI failed: 0x%x", handle.eglGetError());
+        free(bundle);
+        return NULL;
+    }
 
     bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config, (__bridge EGLNativeWindowType)SurfaceViewController.surface.layer, NULL);
     if (!bundle->surface) {
@@ -105,6 +154,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     bundle->context = handle.eglCreateContext(g_EglDisplay, bundle->config, share ? share->context : EGL_NO_CONTEXT, ctx_attribs);
     if (!bundle->context) {
         NSDebugLog(@"EGLBridge: Error eglCreateContext finished with error: 0x%x", handle.eglGetError());
+        handle.eglDestroySurface(g_EglDisplay, bundle->surface);
         free(bundle);
         return NULL;
     }
@@ -129,10 +179,10 @@ void gl_make_current(gl_render_window_t* bundle) {
 }
 
 void gl_swap_buffers() {
-    if (!handle.eglSwapBuffers(g_EglDisplay, currentBundle->gl.surface) && handle.eglGetError() == EGL_BAD_SURFACE) {
-        NSLog(@"eglSwapBuffers error 0x%x", handle.eglGetError());
-        //stopSwapBuffers = true;
-        //closeGLFWWindow();
+    if (!currentBundle) return;
+    if (!handle.eglSwapBuffers(g_EglDisplay, currentBundle->gl.surface)) {
+        EGLint error = handle.eglGetError();
+        NSLog(@"EGLBridge: eglSwapBuffers failed with error 0x%x", error);
     }
 }
 
@@ -142,12 +192,15 @@ void gl_swap_interval(int swapInterval) {
 
 void gl_terminate() {
     handle.eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    handle.eglDestroySurface(g_EglDisplay, currentBundle->gl.surface);
-    handle.eglDestroyContext(g_EglDisplay, currentBundle->gl.context);
+    if (currentBundle) {
+        handle.eglDestroySurface(g_EglDisplay, currentBundle->gl.surface);
+        handle.eglDestroyContext(g_EglDisplay, currentBundle->gl.context);
+    }
     handle.eglTerminate(g_EglDisplay);
     handle.eglReleaseThread();
     free(currentBundle);
     currentBundle = nil;
+    g_EglDisplay = EGL_NO_DISPLAY;
 }
 
 void set_gl_bridge_tbl() {
