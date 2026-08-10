@@ -2,17 +2,17 @@
 SOURCEDIR := src
 OUTPUTDIR := build
 
-# Minecraft 26.2 loads org.lwjgl.util.spvc.Spvc during NativeLibrariesBootstrap.
-# Amethyst replaces Mojang's LWJGL dependencies with its aggregate lwjgl.jar, so
-# the SPVC Java bindings have to be included here as well. Keep this version in
-# lock-step with the LWJGL version requested by Minecraft 26.2. Only the Java
-# bindings are bundled here; MetalUniversal supplies the iOS SPIRV-Cross C library.
+# Minecraft 26.2 requires LWJGL 3.4.1-era Java APIs. The iOS launcher cannot
+# safely mix those Java bindings with its older iOS-native LWJGL build, so this
+# integration branch consumes one coherent AngelAura iOS LWJGL runtime: the
+# module directory produced as bin/RELEASE and the matching natives in bin/out.
+# A helper script in scripts/ builds the pinned runtime reproducibly.
 LWJGL_RUNTIME_VERSION ?= 3.4.1
-LWJGL_MAVEN_BASE ?= https://repo1.maven.org/maven2/org/lwjgl
-LWJGL_SPVC_JAR := $(OUTPUTDIR)/deps/lwjgl-spvc-$(LWJGL_RUNTIME_VERSION).jar
+LWJGL_MODULES_DIR ?=
+LWJGL_IOS_NATIVES_DIR ?=
 
 # Optional MetalUniversal integration. Point this at the directory produced by
-# `./gradlew buildIOSNative buildIOSSpvc` in MetalUniversal, for example:
+# `./gradlew buildIOSNative buildIOSSpvc`, for example:
 #   METALLUM_NATIVE_DIR=/abs/path/MetalUniversal/src/main/resources/natives/ios
 # The root Amethyst Makefile already copies Natives/build/*.dylib into the app's
 # Frameworks directory, so staging here keeps the normal packaging/signing path.
@@ -25,10 +25,54 @@ CLASSES := $(SOURCES:$(SOURCEDIR)/%.java=$(OUTPUTDIR)/%.class)
 TARGETS := $(shell find $(SOURCEDIR) -mindepth 1 -maxdepth 1 -type d)
 TARGETS := $(TARGETS:$(SOURCEDIR)/%=$(OUTPUTDIR)/%.jar)
 
-# Add all jars to classpath and allow compiling with private API
-JCFLAGS := -cp "$(subst $() $(),:,$(wildcard $(SOURCEDIR)/*/):$(wildcard libs/*/*.jar))" -XDignore.symbol.file
+# Keep launcher/caciocavallo dependencies, but never put the repository's old
+# LWJGL jars next to the 3.4.1 modules on javac's class path. Duplicate versions
+# are exactly what caused the Spvc/GLFW linkage failures on Minecraft 26.x.
+NON_LWJGL_LIB_JARS := $(filter-out $(wildcard libs/lwjgl/*.jar),$(wildcard libs/*/*.jar))
+LWJGL_MODULE_JARS := $(shell if [ -n "$(strip $(LWJGL_MODULES_DIR))" ] && [ -d "$(LWJGL_MODULES_DIR)" ]; then find "$(LWJGL_MODULES_DIR)" -type f -name 'lwjgl*.jar' -print | sort; fi)
+JAVA_CLASSPATH_JARS := $(NON_LWJGL_LIB_JARS) $(LWJGL_MODULE_JARS)
 
-all: $(TARGETS) stage_metallum_natives
+# Add all selected jars to classpath and allow compiling with private API.
+JCFLAGS := -cp "$(subst $() $(),:,$(wildcard $(SOURCEDIR)/*/):$(JAVA_CLASSPATH_JARS))" -XDignore.symbol.file
+
+all: require_lwjgl_modules $(TARGETS) stage_lwjgl_natives stage_metallum_natives
+
+require_lwjgl_modules:
+	@set -e
+	@if [ -z "$(strip $(LWJGL_MODULES_DIR))" ]; then \
+		echo "Error: LWJGL_MODULES_DIR is required on feature/metallum-mc26-lwjgl-compat."; \
+		echo "Build AngelAuraMC/lwjgl3 wip/rebase_3.4.1 (pinned by scripts/build_metallum_runtime.sh) and point this variable at bin/RELEASE."; \
+		exit 1; \
+	fi
+	@test -d "$(LWJGL_MODULES_DIR)" || (echo "Error: LWJGL_MODULES_DIR is not a directory: $(LWJGL_MODULES_DIR)"; exit 1)
+	@test -n "$(shell find "$(LWJGL_MODULES_DIR)" -type f -name 'lwjgl.jar' -print -quit 2>/dev/null)" || (echo "Error: coherent LWJGL core jar missing under $(LWJGL_MODULES_DIR)"; exit 1)
+	@test -n "$(shell find "$(LWJGL_MODULES_DIR)" -type f -name 'lwjgl-glfw.jar' -print -quit 2>/dev/null)" || (echo "Error: coherent LWJGL GLFW jar missing under $(LWJGL_MODULES_DIR)"; exit 1)
+	@test -n "$(shell find "$(LWJGL_MODULES_DIR)" -type f -name 'lwjgl-spvc.jar' -print -quit 2>/dev/null)" || (echo "Error: coherent LWJGL SPVC jar missing under $(LWJGL_MODULES_DIR)"; exit 1)
+	@echo "Using coherent LWJGL $(LWJGL_RUNTIME_VERSION) modules from $(LWJGL_MODULES_DIR)"
+
+stage_lwjgl_natives:
+	@set -e
+	@if [ -z "$(strip $(LWJGL_IOS_NATIVES_DIR))" ]; then \
+		echo "Error: LWJGL_IOS_NATIVES_DIR is required for an Amethyst iOS package."; \
+		echo "Point it at bin/out from the same AngelAura LWJGL build as LWJGL_MODULES_DIR."; \
+		exit 1; \
+	fi
+	@test -d "$(LWJGL_IOS_NATIVES_DIR)" || (echo "Error: LWJGL_IOS_NATIVES_DIR is not a directory: $(LWJGL_IOS_NATIVES_DIR)"; exit 1)
+	@mkdir -p "$(METALLUM_STAGE_DIR)"
+	@count=0; \
+	for source in "$(LWJGL_IOS_NATIVES_DIR)"/*.dylib; do \
+		[ -f "$$source" ] || continue; \
+		count=$$((count + 1)); \
+		target="$(METALLUM_STAGE_DIR)/$$(basename "$$source")"; \
+		cp "$$source" "$$target"; \
+		file "$$target" | grep -q 'Mach-O 64-bit arm64' || (echo "Error: $$target is not an arm64 Mach-O"; exit 1); \
+		if command -v vtool >/dev/null 2>&1; then \
+			vtool -show-build "$$target" | grep -qi 'platform IOS' || (echo "Error: $$target is not built for iOS"; exit 1); \
+		fi; \
+		if command -v ldid >/dev/null 2>&1; then ldid -S -M "$$target"; fi; \
+	done; \
+	[ "$$count" -gt 0 ] || (echo "Error: no iOS LWJGL dylibs found in $(LWJGL_IOS_NATIVES_DIR)"; exit 1); \
+	echo "Staged $$count coherent LWJGL iOS natives into Amethyst Frameworks input"
 
 stage_metallum_natives:
 	@set -e
@@ -53,7 +97,7 @@ stage_metallum_natives:
 	else \
 		echo "MetalUniversal native staging disabled (METALLUM_NATIVE_DIR not set)"; \
 	fi
-	
+
 # Sometimes the CI produces empty class file resulting in broken jar, so we check and abort here
 check_empty_classes:
 	@set -e
@@ -65,6 +109,7 @@ check_empty_classes:
 	fi
 
 # Rules for building java class
+$(CLASSES): require_lwjgl_modules
 $(CLASSES): $(OUTPUTDIR)/%.class: $(SOURCEDIR)/%.java
 	@set -e
 	$(eval TARGET=$(word 2, $(subst /, ,$@)))
@@ -79,25 +124,24 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@echo "Creating $@"
 	@$(BOOTJDK)/jar -cf $@ -C $(basename $@) .
 
-$(LWJGL_SPVC_JAR):
+$(OUTPUTDIR)/lwjgl.jar: require_lwjgl_modules $(CLASSES) check_empty_classes
 	@set -e
-	@echo "Fetching LWJGL SPVC Java bindings $(LWJGL_RUNTIME_VERSION)"
-	@mkdir -p $(dir $@)
-	@curl --fail --location --retry 3 --retry-delay 1 \
-		-o "$@.tmp" \
-		"$(LWJGL_MAVEN_BASE)/lwjgl-spvc/$(LWJGL_RUNTIME_VERSION)/lwjgl-spvc-$(LWJGL_RUNTIME_VERSION).jar"
-	@mv "$@.tmp" "$@"
-
-$(OUTPUTDIR)/lwjgl.jar: $(CLASSES) check_empty_classes $(LWJGL_SPVC_JAR)
-	@set -e
-	@echo "Creating $@"
+	@echo "Creating coherent aggregate LWJGL $(LWJGL_RUNTIME_VERSION) jar"
 	@rm -rf $(OUTPUTDIR)/lwjgl_lib
 	@mkdir -p $(OUTPUTDIR)/lwjgl_lib
-	@cd $(OUTPUTDIR)/lwjgl_lib && find ../../libs/lwjgl -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && $(BOOTJDK)/jar -xf ../deps/lwjgl-spvc-$(LWJGL_RUNTIME_VERSION).jar && rm -rf META-INF
+	@set -e; \
+	for module in $$(find "$(LWJGL_MODULES_DIR)" -type f -name 'lwjgl*.jar' -print | sort); do \
+		(cd $(OUTPUTDIR)/lwjgl_lib && $(BOOTJDK)/jar -xf "$$OLDPWD/$$module"); \
+	done
+	@rm -rf $(OUTPUTDIR)/lwjgl_lib/META-INF
 	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib/
 	@test -f $(OUTPUTDIR)/lwjgl_lib/org/lwjgl/util/spvc/Spvc.class || (echo "Error: LWJGL SPVC bindings missing from aggregate lwjgl.jar"; exit 1)
+	@test -f $(OUTPUTDIR)/lwjgl_lib/org/lwjgl/glfw/GLFWPreeditCallback.class || (echo "Error: LWJGL 3.4 preedit callbacks missing from aggregate lwjgl.jar"; exit 1)
 	@$(BOOTJDK)/jar -cf $@ -C $(OUTPUTDIR)/lwjgl_lib .
 	@$(BOOTJDK)/jar -tf $@ | grep -q '^org/lwjgl/util/spvc/Spvc.class$$' || (echo "Error: generated lwjgl.jar does not contain Spvc.class"; exit 1)
+	@$(BOOTJDK)/javap -classpath $@ org.lwjgl.system.Configuration | grep -q 'SPVC_LIBRARY_NAME' || (echo "Error: generated lwjgl.jar lacks Configuration.SPVC_LIBRARY_NAME"; exit 1)
+	@$(BOOTJDK)/javap -classpath $@ org.lwjgl.glfw.GLFW | grep -q 'glfwPlatformSupported' || (echo "Error: generated lwjgl.jar lacks glfwPlatformSupported"; exit 1)
+	@$(BOOTJDK)/javap -classpath $@ org.lwjgl.glfw.GLFW | grep -q 'glfwSetPreeditCallback' || (echo "Error: generated lwjgl.jar lacks GLFW 3.4 preedit callback ABI"; exit 1)
 
 $(OUTPUTDIR)/patchjna_agent.jar: $(CLASSES)
 	@set -e
@@ -109,4 +153,4 @@ clean:
 	rm -rf $(OUTPUTDIR)
 
 .SUFFIXES: .java
-.PHONY: all clean stage_metallum_natives
+.PHONY: all clean require_lwjgl_modules stage_lwjgl_natives stage_metallum_natives
