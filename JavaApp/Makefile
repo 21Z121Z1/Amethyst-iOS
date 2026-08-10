@@ -6,10 +6,18 @@ OUTPUTDIR := build
 # Amethyst replaces Mojang's LWJGL dependencies with its aggregate lwjgl.jar, so
 # the SPVC Java bindings have to be included here as well. Keep this version in
 # lock-step with the LWJGL version requested by Minecraft 26.2. Only the Java
-# bindings are bundled; MetalUniversal supplies the iOS SPIRV-Cross C library.
+# bindings are bundled here; MetalUniversal supplies the iOS SPIRV-Cross C library.
 LWJGL_RUNTIME_VERSION ?= 3.4.1
 LWJGL_MAVEN_BASE ?= https://repo1.maven.org/maven2/org/lwjgl
 LWJGL_SPVC_JAR := $(OUTPUTDIR)/deps/lwjgl-spvc-$(LWJGL_RUNTIME_VERSION).jar
+
+# Optional MetalUniversal integration. Point this at the directory produced by
+# `./gradlew buildIOSNative buildIOSSpvc` in MetalUniversal, for example:
+#   METALLUM_NATIVE_DIR=/abs/path/MetalUniversal/src/main/resources/natives/ios
+# The root Amethyst Makefile already copies Natives/build/*.dylib into the app's
+# Frameworks directory, so staging here keeps the normal packaging/signing path.
+METALLUM_NATIVE_DIR ?=
+METALLUM_STAGE_DIR := ../Natives/build
 
 SOURCES := $(shell find $(SOURCEDIR) -type f -name '*.java')
 CLASSES := $(SOURCES:$(SOURCEDIR)/%.java=$(OUTPUTDIR)/%.class)
@@ -20,7 +28,31 @@ TARGETS := $(TARGETS:$(SOURCEDIR)/%=$(OUTPUTDIR)/%.jar)
 # Add all jars to classpath and allow compiling with private API
 JCFLAGS := -cp "$(subst $() $(),:,$(wildcard $(SOURCEDIR)/*/):$(wildcard libs/*/*.jar))" -XDignore.symbol.file
 
-all: $(TARGETS)
+all: $(TARGETS) stage_metallum_natives
+
+stage_metallum_natives:
+	@set -e
+	@if [ -n "$(strip $(METALLUM_NATIVE_DIR))" ]; then \
+		echo "Staging MetalUniversal iOS natives from $(METALLUM_NATIVE_DIR)"; \
+		test -f "$(METALLUM_NATIVE_DIR)/libmetallum.dylib" || (echo "Error: missing libmetallum.dylib; run MetalUniversal buildIOSNative first"; exit 1); \
+		test -f "$(METALLUM_NATIVE_DIR)/libspvc.dylib" || (echo "Error: missing libspvc.dylib; run MetalUniversal buildIOSSpvc first"; exit 1); \
+		mkdir -p "$(METALLUM_STAGE_DIR)"; \
+		cp "$(METALLUM_NATIVE_DIR)/libmetallum.dylib" "$(METALLUM_STAGE_DIR)/libmetallum.dylib"; \
+		cp "$(METALLUM_NATIVE_DIR)/libspvc.dylib" "$(METALLUM_STAGE_DIR)/libspvc_metallum.dylib"; \
+		file "$(METALLUM_STAGE_DIR)/libmetallum.dylib" | grep -q 'Mach-O 64-bit arm64' || (echo "Error: libmetallum.dylib is not an arm64 Mach-O"; exit 1); \
+		file "$(METALLUM_STAGE_DIR)/libspvc_metallum.dylib" | grep -q 'Mach-O 64-bit arm64' || (echo "Error: libspvc_metallum.dylib is not an arm64 Mach-O"; exit 1); \
+		if command -v vtool >/dev/null 2>&1; then \
+			vtool -show-build "$(METALLUM_STAGE_DIR)/libmetallum.dylib" | grep -qi 'platform IOS' || (echo "Error: libmetallum.dylib is not built for iOS"; exit 1); \
+			vtool -show-build "$(METALLUM_STAGE_DIR)/libspvc_metallum.dylib" | grep -qi 'platform IOS' || (echo "Error: libspvc_metallum.dylib is not built for iOS"; exit 1); \
+		fi; \
+		if command -v ldid >/dev/null 2>&1; then \
+			ldid -S -M "$(METALLUM_STAGE_DIR)/libmetallum.dylib"; \
+			ldid -S -M "$(METALLUM_STAGE_DIR)/libspvc_metallum.dylib"; \
+		fi; \
+		echo "MetalUniversal natives staged for Amethyst Frameworks"; \
+	else \
+		echo "MetalUniversal native staging disabled (METALLUM_NATIVE_DIR not set)"; \
+	fi
 	
 # Sometimes the CI produces empty class file resulting in broken jar, so we check and abort here
 check_empty_classes:
@@ -77,4 +109,4 @@ clean:
 	rm -rf $(OUTPUTDIR)
 
 .SUFFIXES: .java
-.PHONY: all clean
+.PHONY: all clean stage_metallum_natives
