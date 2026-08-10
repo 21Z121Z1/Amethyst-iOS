@@ -135,7 +135,8 @@ $(OUTPUTDIR)/lwjgl.jar: require_lwjgl_modules $(LWJGL_CLASSES) check_empty_class
 	@mkdir -p $(OUTPUTDIR)/lwjgl_lib
 	@set -e; \
 	for module in $$(find "$(LWJGL_MODULES_DIR)" -type f -name 'lwjgl*.jar' -print | sort); do \
-		(cd $(OUTPUTDIR)/lwjgl_lib && $(BOOTJDK)/jar -xf "$$OLDPWD/$$module"); \
+		module="$$(cd "$$(dirname "$$module")" && pwd)/$$(basename "$$module")"; \
+		(cd $(OUTPUTDIR)/lwjgl_lib && $(BOOTJDK)/jar -xf "$$module"); \
 	done
 	@rm -rf $(OUTPUTDIR)/lwjgl_lib/META-INF
 	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib/
