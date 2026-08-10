@@ -121,12 +121,26 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     }
 
     CALayer *nativeLayer = SurfaceViewController.surface.layer;
-    if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL] &&
-        ![nativeLayer isKindOfClass:CAMetalLayer.class]) {
-        NSLog(@"EGLBridge: Mithril requires a CAMetalLayer native window");
-        free(bundle);
-        return NULL;
+    if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
+        if (![nativeLayer isKindOfClass:CAMetalLayer.class]) {
+            NSLog(@"EGLBridge: Mithril requires a CAMetalLayer native window");
+            free(bundle);
+            return NULL;
+        }
+
+        // Amethyst expresses its render resolution through the surface layer's
+        // contentsScale. Make that contract explicit for Mithril before it
+        // snapshots CAMetalLayer.drawableSize in eglCreateWindowSurface.
+        CAMetalLayer *metalLayer = (CAMetalLayer *)nativeLayer;
+        const CGFloat scale = nativeLayer.contentsScale > 0.0
+            ? nativeLayer.contentsScale : UIScreen.mainScreen.scale;
+        const CGSize bounds = nativeLayer.bounds.size;
+        const CGSize drawableSize = CGSizeMake(bounds.width * scale,
+                                                bounds.height * scale);
+        if (drawableSize.width > 0.0 && drawableSize.height > 0.0)
+            metalLayer.drawableSize = drawableSize;
     }
+
     bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config,
         (__bridge EGLNativeWindowType)nativeLayer, NULL);
     if (!bundle->surface) {
