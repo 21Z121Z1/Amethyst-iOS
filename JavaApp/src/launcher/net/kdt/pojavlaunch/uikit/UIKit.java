@@ -45,6 +45,18 @@ public class UIKit {
         method.invoke(null, new Object[]{args});
     }
 
+    /**
+     * Compatibility hook retained for the Minecraft 26.x GLFW shim.
+     *
+     * <p>The old launcher-side guiScale bridge was intentionally removed from
+     * current Amethyst. Cursor-mode changes still call this historical hook in
+     * the 3.4-compatible GLFW facade, so keep it as a no-op rather than
+     * restoring the deleted MCOptionUtils/native guiScale implementation.
+     */
+    public static void updateMCGuiScale() {
+        // Current Amethyst owns GUI scaling outside this legacy Java hook.
+    }
+
     static {
         System.load(System.getenv("BUNDLE_PATH") + "/AngelAuraAmethyst");
     }
