@@ -21,6 +21,8 @@ METALLUM_STAGE_DIR := ../Natives/build
 
 SOURCES := $(shell find $(SOURCEDIR) -type f -name '*.java')
 CLASSES := $(SOURCES:$(SOURCEDIR)/%.java=$(OUTPUTDIR)/%.class)
+LWJGL_SOURCES := $(shell find $(SOURCEDIR)/lwjgl -type f -name '*.java')
+LWJGL_CLASSES := $(LWJGL_SOURCES:$(SOURCEDIR)/%.java=$(OUTPUTDIR)/%.class)
 
 TARGETS := $(shell find $(SOURCEDIR) -mindepth 1 -maxdepth 1 -type d)
 TARGETS := $(TARGETS:$(SOURCEDIR)/%=$(OUTPUTDIR)/%.jar)
@@ -124,7 +126,9 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@echo "Creating $@"
 	@$(BOOTJDK)/jar -cf $@ -C $(basename $@) .
 
-$(OUTPUTDIR)/lwjgl.jar: require_lwjgl_modules $(CLASSES) check_empty_classes
+# Keep this target independent from launcher/AWT sources so it can be checked on
+# a GitHub-hosted Linux runner. Full iOS packaging still builds all Java targets.
+$(OUTPUTDIR)/lwjgl.jar: require_lwjgl_modules $(LWJGL_CLASSES) check_empty_classes
 	@set -e
 	@echo "Creating coherent aggregate LWJGL $(LWJGL_RUNTIME_VERSION) jar"
 	@rm -rf $(OUTPUTDIR)/lwjgl_lib
