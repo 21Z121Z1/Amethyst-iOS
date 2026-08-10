@@ -2,6 +2,15 @@
 SOURCEDIR := src
 OUTPUTDIR := build
 
+# Minecraft 26.2 loads org.lwjgl.util.spvc.Spvc during NativeLibrariesBootstrap.
+# Amethyst replaces Mojang's LWJGL dependencies with its aggregate lwjgl.jar, so
+# the SPVC Java bindings have to be included here as well. Keep this version in
+# lock-step with the LWJGL version requested by Minecraft 26.2. Only the Java
+# bindings are bundled; MetalUniversal supplies the iOS SPIRV-Cross C library.
+LWJGL_RUNTIME_VERSION ?= 3.4.1
+LWJGL_MAVEN_BASE ?= https://repo1.maven.org/maven2/org/lwjgl
+LWJGL_SPVC_JAR := $(OUTPUTDIR)/deps/lwjgl-spvc-$(LWJGL_RUNTIME_VERSION).jar
+
 SOURCES := $(shell find $(SOURCEDIR) -type f -name '*.java')
 CLASSES := $(SOURCES:$(SOURCEDIR)/%.java=$(OUTPUTDIR)/%.class)
 
@@ -38,13 +47,25 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@echo "Creating $@"
 	@$(BOOTJDK)/jar -cf $@ -C $(basename $@) .
 
-$(OUTPUTDIR)/lwjgl.jar: $(CLASSES) check_empty_classes
+$(LWJGL_SPVC_JAR):
+	@set -e
+	@echo "Fetching LWJGL SPVC Java bindings $(LWJGL_RUNTIME_VERSION)"
+	@mkdir -p $(dir $@)
+	@curl --fail --location --retry 3 --retry-delay 1 \
+		-o "$@.tmp" \
+		"$(LWJGL_MAVEN_BASE)/lwjgl-spvc/$(LWJGL_RUNTIME_VERSION)/lwjgl-spvc-$(LWJGL_RUNTIME_VERSION).jar"
+	@mv "$@.tmp" "$@"
+
+$(OUTPUTDIR)/lwjgl.jar: $(CLASSES) check_empty_classes $(LWJGL_SPVC_JAR)
 	@set -e
 	@echo "Creating $@"
+	@rm -rf $(OUTPUTDIR)/lwjgl_lib
 	@mkdir -p $(OUTPUTDIR)/lwjgl_lib
-	@cd $(OUTPUTDIR)/lwjgl_lib && find ../../libs/lwjgl -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && rm -rf META-INF
+	@cd $(OUTPUTDIR)/lwjgl_lib && find ../../libs/lwjgl -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && $(BOOTJDK)/jar -xf ../deps/lwjgl-spvc-$(LWJGL_RUNTIME_VERSION).jar && rm -rf META-INF
 	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib/
+	@test -f $(OUTPUTDIR)/lwjgl_lib/org/lwjgl/util/spvc/Spvc.class || (echo "Error: LWJGL SPVC bindings missing from aggregate lwjgl.jar"; exit 1)
 	@$(BOOTJDK)/jar -cf $@ -C $(OUTPUTDIR)/lwjgl_lib .
+	@$(BOOTJDK)/jar -tf $@ | grep -q '^org/lwjgl/util/spvc/Spvc.class$$' || (echo "Error: generated lwjgl.jar does not contain Spvc.class"; exit 1)
 
 $(OUTPUTDIR)/patchjna_agent.jar: $(CLASSES)
 	@set -e
