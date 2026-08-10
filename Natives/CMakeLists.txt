@@ -49,6 +49,30 @@ target_link_libraries(awt_xawt
 
 set(CMAKE_FRAMEWORK_PATH "${CMAKE_CURRENT_LIST_DIR}/resources/Frameworks")
 
+# Optional Mithril renderer staging. The top-level Makefile already copies every
+# dylib emitted into Natives/build into AngelAuraAmethyst.app/Frameworks, so a
+# real iPhoneOS libmithril.dylib only needs to be staged into this build dir.
+# A direct -DMITHRIL_DYLIB=... value wins; otherwise the environment variable
+# of the same name is used. Builds without Mithril remain unchanged.
+set(MITHRIL_DYLIB "$ENV{MITHRIL_DYLIB}" CACHE FILEPATH
+    "Path to an iphoneos arm64 libmithril.dylib to bundle as a renderer")
+if(MITHRIL_DYLIB)
+  if(NOT EXISTS "${MITHRIL_DYLIB}")
+    message(FATAL_ERROR "MITHRIL_DYLIB does not exist: ${MITHRIL_DYLIB}")
+  endif()
+  get_filename_component(MITHRIL_DYLIB_NAME "${MITHRIL_DYLIB}" NAME)
+  if(NOT MITHRIL_DYLIB_NAME STREQUAL "libmithril.dylib")
+    message(FATAL_ERROR
+      "MITHRIL_DYLIB must point to a file named libmithril.dylib; got ${MITHRIL_DYLIB_NAME}")
+  endif()
+  add_custom_target(stage_mithril_renderer ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MITHRIL_DYLIB}"
+            "${CMAKE_CURRENT_BINARY_DIR}/libmithril.dylib"
+    COMMENT "Staging Mithril renderer for Amethyst Frameworks"
+    VERBATIM)
+endif()
+
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rpath @executable_path/Frameworks -rpath @loader_path/Frameworks")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -rpath @executable_path/Frameworks -rpath @loader_path/Frameworks")
 
