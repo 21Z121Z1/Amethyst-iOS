@@ -5,8 +5,10 @@ import json
 import os
 import signal
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
+from .container_io import AgentContainerClient
 from .store import StateStore
 from .supervisor import Supervisor
 
@@ -17,6 +19,57 @@ class AgentServer:
         self.supervisor = Supervisor(self.store)
         self.server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
+
+    async def _stop_current(self, force: bool = False, timeout: float = 30) -> dict[str, Any]:
+        state = self.store.load()
+        if state is None:
+            return {"ok": True, "observed": True, "state": "no_active_run"}
+        if not self.supervisor.device_udid or not self.supervisor.device.pmd3_python_api_available():
+            return {"ok": False, "error": "transport_unavailable", "detail": "cannot reach Agent v2 control channel"}
+
+        client = AgentContainerClient(self.supervisor.device_udid, self.supervisor.bundle_id)
+        response = await self.supervisor._agent_request(
+            client,
+            state,
+            "terminate",
+            {"force": force},
+            guard_generation=bool(state.process_generation),
+            timeout=min(timeout, 20),
+        )
+        if not response.get("ok"):
+            return {"ok": False, "observed": False, "response": response}
+        if force:
+            self.supervisor.close()
+            return {
+                "ok": False,
+                "accepted": True,
+                "observed": False,
+                "detail": "force-exit was accepted; this path intentionally does not claim process exit without a fresh process observation",
+                "response": response,
+            }
+
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            probe = await self.supervisor._agent_request(
+                client,
+                state,
+                "status",
+                guard_generation=False,
+                timeout=min(5, max(1, deadline - monotonic())),
+            )
+            if probe.get("ok") and probe.get("state") == "launcher":
+                self.supervisor._observe_identity(state, probe)
+                self.store.save(state)
+                self.supervisor.close()
+                return {"ok": True, "accepted": True, "observed": True, "response": probe}
+            await asyncio.sleep(0.25)
+        return {
+            "ok": False,
+            "accepted": True,
+            "observed": False,
+            "detail": "terminate request was accepted but launcher state was not observed before timeout",
+            "response": response,
+        }
 
     async def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         method = request.get("method")
@@ -29,7 +82,11 @@ class AgentServer:
             return self.supervisor.status()
         if method == "deploy":
             return await self.supervisor.deploy(**params)
+        if method == "stop":
+            return await self._stop_current(**params)
         if method == "run_smoke":
+            if self.supervisor.jit is not None:
+                self.supervisor.close()
             result = await self.supervisor.run_smoke(**params)
             state = result.get("state") or {}
             run_id = state.get("run_id")
@@ -40,6 +97,8 @@ class AgentServer:
                     screenshot=True,
                 )
                 result["artifacts"] = collection
+            if not result.get("ok"):
+                self.supervisor.close()
             return result
         if method == "stage_payload":
             return await self.supervisor.stage_payload(**params)
