@@ -86,6 +86,10 @@ def parser() -> argparse.ArgumentParser:
     deploy = sub.add_parser("deploy")
     deploy.add_argument("app", help="Development-signed .app directory or .ipa")
 
+    stop = sub.add_parser("stop")
+    stop.add_argument("--force", action="store_true")
+    stop.add_argument("--timeout", type=float, default=30)
+
     run = sub.add_parser("run")
     run_sub = run.add_subparsers(dest="run_kind", required=True)
     smoke = run_sub.add_parser("smoke")
@@ -136,6 +140,8 @@ def main() -> int:
             return emit(asyncio.run(call("status")))
         if args.command == "deploy":
             return emit(asyncio.run(call("deploy", {"app_path": args.app})))
+        if args.command == "stop":
+            return emit(asyncio.run(call("stop", {"force": args.force, "timeout": args.timeout})))
         if args.command == "run" and args.run_kind == "smoke":
             return emit(
                 asyncio.run(
