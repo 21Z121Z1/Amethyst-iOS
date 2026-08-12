@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amethyst.invalid/agent-protocol/v2.schema.json",
+  "title": "Amethyst Agent v2 request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "request_id", "run_id", "action"],
+  "properties": {
+    "protocol": { "const": "amethyst-agent/v2" },
+    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
+    "run_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
+    "action": {
+      "enum": [
+        "status",
+        "probe/runtime",
+        "probe/jit",
+        "profile/set",
+        "launch",
+        "terminate"
+      ]
+    },
+    "if_process_generation": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "params": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "type": "string", "maxLength": 256 },
+        "version": { "type": "string", "maxLength": 256 },
+        "instance": { "type": "string", "maxLength": 256 },
+        "force": { "type": "boolean" }
+      }
+    }
+  }
+}
