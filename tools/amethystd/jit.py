@@ -5,6 +5,7 @@ import os
 import shlex
 import socket
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, sleep
@@ -14,9 +15,7 @@ from .device import DeviceController
 
 
 @dataclass
-class JITEvidence:
-    exec_ready: bool
-    dynamic_library_load_ready: bool
+class JITAttachEvidence:
     port: int
     processor_log: str
     debugserver_log: str
@@ -24,8 +23,6 @@ class JITEvidence:
 
     def to_dict(self) -> dict:
         return {
-            "exec_ready": self.exec_ready,
-            "dynamic_library_load_ready": self.dynamic_library_load_ready,
             "port": self.port,
             "processor_log": self.processor_log,
             "debugserver_log": self.debugserver_log,
@@ -33,10 +30,32 @@ class JITEvidence:
         }
 
 
+@dataclass
+class JITHostEvidence:
+    exec_ready: bool
+    keep_attached: bool
+    processor_log: str
+
+    def to_dict(self) -> dict:
+        return {
+            "exec_ready": self.exec_ready,
+            "keep_attached": self.keep_attached,
+            "processor_log": self.processor_log,
+        }
+
+
 class JITSession:
-    """Own debugserver forwarding and an external UniversalJIT26 processor for one process generation."""
+    """Own debugserver forwarding and UniversalJIT26 processing for one app process generation.
+
+    Attachment and JIT proof are deliberately separate.  The processor must be
+    attached *before* Minecraft launch so it can catch the breakpoints emitted
+    by `launchJVM`; executable mapping cannot be proven until after launch.
+    """
 
     STALE_MARKERS = ("E96",)
+    ATTACHED_MARKER = "AMETHYST_JIT_PROCESSOR_ATTACHED"
+    EXEC_MARKER = "AMETHYST_JIT_HOST_EXEC_READY"
+    KEEP_ATTACHED_MARKER = "AMETHYST_JIT_KEEP_ATTACHED value=true"
 
     def __init__(self, device: DeviceController, artifact_dir: Path) -> None:
         self.device = device
@@ -45,6 +64,10 @@ class JITSession:
         self.processor: subprocess.Popen[str] | None = None
         self._handles: list[TextIO] = []
         self.identity: tuple[int, str] | None = None
+        self.processor_log: Path | None = None
+        self.debugserver_log: Path | None = None
+        self.port: int | None = None
+        self.attempt: int = 0
 
     @staticmethod
     def _free_port() -> int:
@@ -53,22 +76,19 @@ class JITSession:
             return int(sock.getsockname()[1])
 
     @staticmethod
-    def _contains_all(path: Path, markers: tuple[str, ...]) -> bool:
-        if not path.exists():
-            return False
-        text = path.read_text(encoding="utf-8", errors="replace")
-        return all(marker in text for marker in markers)
+    def _text(path: Path | None) -> str:
+        if path is None or not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
 
-    @staticmethod
-    def _contains_any(path: Path, markers: tuple[str, ...]) -> bool:
-        if not path.exists():
-            return False
-        text = path.read_text(encoding="utf-8", errors="replace")
+    @classmethod
+    def _contains_any(cls, path: Path | None, markers: tuple[str, ...]) -> bool:
+        text = cls._text(path)
         return any(marker in text for marker in markers)
 
     @staticmethod
     def _port_is_claimed(port: int) -> bool:
-        """Check listener ownership without opening a connection that could consume debugserver's only client."""
+        """Check listener ownership without consuming debugserver's only client."""
         with socket.socket() as probe:
             try:
                 probe.bind(("127.0.0.1", port))
@@ -87,6 +107,20 @@ class JITSession:
             sleep(0.05)
         raise TimeoutError("debugserver local forwarding did not claim its local port")
 
+    def _processor_command(self, port: int, pid: int, run_id: str, process_generation: str) -> list[str]:
+        configured = os.environ.get("AMETHYST_JIT_PROCESSOR")
+        values = {
+            "host": "127.0.0.1",
+            "port": str(port),
+            "pid": str(pid),
+            "run_id": run_id,
+            "process_generation": process_generation,
+        }
+        if configured:
+            return [part.format(**values) for part in shlex.split(configured)]
+        processor = Path(__file__).with_name("universal_jit26_processor.py")
+        return [sys.executable, str(processor), "--host", "127.0.0.1", "--port", str(port), "--pid", str(pid)]
+
     def _stop_children(self, *, reset_identity: bool) -> None:
         for process in (self.processor, self.debugserver):
             if process and process.poll() is None:
@@ -104,17 +138,15 @@ class JITSession:
             handle.close()
         self._handles.clear()
 
-    def _attempt(
+    def _start_attempt(
         self,
         *,
         pid: int,
         process_generation: str,
         run_id: str,
-        processor_template: str,
-        require_dynamic_library_load: bool,
         deadline: float,
         attempt: int,
-    ) -> JITEvidence:
+    ) -> JITAttachEvidence:
         prefix = self.device.pmd3_prefix()
         if not prefix:
             raise RuntimeError("pymobiledevice3 command is unavailable")
@@ -131,7 +163,15 @@ class JITSession:
 
         env = os.environ.copy()
         env["PYMOBILEDEVICE3_UDID"] = self.device.udid
-        debug_command = [*prefix, "developer", "debugserver", "start-server", "--local-port", str(port)]
+        debug_command = [
+            *prefix,
+            "developer",
+            "debugserver",
+            "start-server",
+            "--userspace",
+            "--local-port",
+            str(port),
+        ]
         self.debugserver = subprocess.Popen(
             debug_command,
             text=True,
@@ -141,89 +181,55 @@ class JITSession:
         )
         self._wait_listener(port, deadline)
 
-        values = {
-            "host": "127.0.0.1",
-            "port": str(port),
-            "pid": str(pid),
-            "run_id": run_id,
-            "process_generation": process_generation,
-        }
-        processor_command = [part.format(**values) for part in shlex.split(processor_template)]
         self.processor = subprocess.Popen(
-            processor_command,
+            self._processor_command(port, pid, run_id, process_generation),
             text=True,
             stdout=processor_handle,
             stderr=subprocess.STDOUT,
             env=env,
         )
+        self.port = port
+        self.processor_log = processor_log
+        self.debugserver_log = debug_log
+        self.attempt = attempt
 
-        exec_markers = tuple(
-            marker
-            for marker in os.environ.get("AMETHYST_JIT_EXEC_MARKERS", "Got JIT mapping,mapping at RW=").split(",")
-            if marker
-        )
-        dyld_markers = tuple(
-            marker
-            for marker in os.environ.get("AMETHYST_JIT_DYLD_MARKERS", "DyldLVBypass hooks succeeded").split(",")
-            if marker
-        )
         while monotonic() < deadline:
             debug_handle.flush()
             processor_handle.flush()
             if self._contains_any(debug_log, self.STALE_MARKERS) or self._contains_any(processor_log, self.STALE_MARKERS):
                 raise StaleDebugserverError(f"stale debugserver signature observed on attempt {attempt}")
-            exec_ready = self._contains_all(processor_log, exec_markers)
-            dyld_ready = self._contains_all(processor_log, dyld_markers)
-            if exec_ready and (dyld_ready or not require_dynamic_library_load):
-                return JITEvidence(exec_ready, dyld_ready, port, str(processor_log), str(debug_log), attempt)
+            if self.ATTACHED_MARKER in self._text(processor_log):
+                return JITAttachEvidence(port, str(processor_log), str(debug_log), attempt)
             if self.processor.poll() is not None:
-                break
-            sleep(0.1)
+                raise JITAttachError(f"UniversalJIT26 processor exited before attach with {self.processor.returncode}")
+            sleep(0.05)
+        raise TimeoutError("UniversalJIT26 processor did not confirm attach before timeout")
 
-        debug_handle.flush()
-        processor_handle.flush()
-        if self._contains_any(debug_log, self.STALE_MARKERS) or self._contains_any(processor_log, self.STALE_MARKERS):
-            raise StaleDebugserverError(f"stale debugserver signature observed on attempt {attempt}")
-        exec_ready = self._contains_all(processor_log, exec_markers)
-        dyld_ready = self._contains_all(processor_log, dyld_markers)
-        if not exec_ready:
-            raise JITVerificationError(f"UniversalJIT26 mapping proof not observed; see {processor_log}")
-        if require_dynamic_library_load and not dyld_ready:
-            raise DyldVerificationError(f"persistent-attached Dyld bypass proof not observed; see {processor_log}")
-        return JITEvidence(exec_ready, dyld_ready, port, str(processor_log), str(debug_log), attempt)
-
-    def ensure(
+    def start(
         self,
         *,
         pid: int,
         process_generation: str,
         run_id: str,
-        require_dynamic_library_load: bool,
-        timeout: float = 45,
-    ) -> JITEvidence:
+        timeout: float = 20,
+    ) -> JITAttachEvidence:
         identity = (pid, process_generation)
         if self.identity and self.identity != identity:
             self.close()
+        elif self.processor and self.processor.poll() is None and self.identity == identity:
+            if self.ATTACHED_MARKER in self._text(self.processor_log):
+                return JITAttachEvidence(self.port or 0, str(self.processor_log), str(self.debugserver_log), self.attempt)
         self.identity = identity
-
-        processor_template = os.environ.get("AMETHYST_JIT_PROCESSOR")
-        if not processor_template:
-            raise JITProcessorUnconfigured(
-                "AMETHYST_JIT_PROCESSOR is not configured; the repository does not contain a verified "
-                "host UniversalJIT26 breakpoint processor"
-            )
 
         max_attempts = max(1, min(int(os.environ.get("AMETHYST_JIT_MAX_ATTEMPTS", "3")), 5))
         deadline = monotonic() + timeout
         last_stale: StaleDebugserverError | None = None
         for attempt in range(1, max_attempts + 1):
             try:
-                return self._attempt(
+                return self._start_attempt(
                     pid=pid,
                     process_generation=process_generation,
                     run_id=run_id,
-                    processor_template=processor_template,
-                    require_dynamic_library_load=require_dynamic_library_load,
                     deadline=deadline,
                     attempt=attempt,
                 )
@@ -233,13 +239,29 @@ class JITSession:
                 if attempt >= max_attempts or monotonic() >= deadline:
                     raise
                 sleep(min(0.15 * attempt, 0.5))
-        raise last_stale or JITVerificationError("JIT session exhausted without evidence")
+        raise last_stale or JITAttachError("JIT attach exhausted without evidence")
+
+    def wait_for_host_exec(self, *, require_keep_attached: bool, timeout: float) -> JITHostEvidence:
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            if self._contains_any(self.debugserver_log, self.STALE_MARKERS) or self._contains_any(self.processor_log, self.STALE_MARKERS):
+                raise StaleDebugserverError("stale debugserver signature observed after launch")
+            text = self._text(self.processor_log)
+            exec_ready = self.EXEC_MARKER in text
+            keep_attached = self.KEEP_ATTACHED_MARKER in text
+            if exec_ready and (keep_attached or not require_keep_attached):
+                return JITHostEvidence(exec_ready, keep_attached, str(self.processor_log))
+            if self.processor is None or self.processor.poll() is not None:
+                code = None if self.processor is None else self.processor.returncode
+                raise JITVerificationError(f"UniversalJIT26 processor exited before executable proof (code={code})")
+            sleep(0.1)
+        raise JITVerificationError(f"UniversalJIT26 host executable proof not observed; see {self.processor_log}")
 
     def close(self) -> None:
         self._stop_children(reset_identity=True)
 
 
-class JITProcessorUnconfigured(RuntimeError):
+class JITAttachError(RuntimeError):
     pass
 
 
