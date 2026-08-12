@@ -1,6 +1,6 @@
 # Physical-device gates
 
-CI and repository tests can prove state-machine, protocol, JSON, retry, manifest, and packaging invariants. They cannot prove iPad-only behavior.
+CI and repository tests can prove state-machine, protocol, JSON, retry, manifest, RSP framing, and packaging invariants. They cannot prove iPad-only behavior.
 
 ## One-time bootstrap prerequisites
 
@@ -8,28 +8,30 @@ CI and repository tests can prove state-machine, protocol, JSON, retry, manifest
 - Developer Mode enabled where required;
 - valid Apple Development signing/provisioning for the AgentDebug bundle;
 - a preconfigured test account/profile or other noninteractive way to reach the desired Minecraft test scenario;
-- the host UniversalJIT26 breakpoint processor used by this Amethyst/iOS version, configured for `amethystd` without committing local credentials/pair records.
+- the bundled `tools/amethystd/universal_jit26_processor.py` (or an explicitly configured compatible override); no pair records, credentials, or signing material are committed.
 
 ## Gate A — device/JIT smoke
 
 From a clean host supervisor state:
 
 1. discover the exact target device and AgentDebug bundle;
-2. launch/reconcile Amethyst;
-3. observe v2 process generation;
-4. establish debugserver/processor for that generation;
-5. observe UniversalJIT26 RX/RW mapping proof;
-6. when external dylibs are required, keep the debugger processor attached and observe Dyld-bypass proof;
-7. issue v2 status/probe requests through House Arrest;
-8. terminate/return to launcher and collect run artifacts.
+2. launch/reconcile Amethyst and observe Agent v2 `process_generation`;
+3. establish userspace debugserver forwarding for that generation;
+4. attach the UniversalJIT26 processor and observe `AMETHYST_JIT_PROCESSOR_ATTACHED`;
+5. request Minecraft launch so `launchJVM` can emit the UniversalJIT26 breakpoints;
+6. observe host-side UniversalJIT26 RX allocation/page preparation;
+7. independently observe fresh Amethyst log proof for `Got JIT mapping` and the RW/RX mapping;
+8. when external dylibs are required, keep the processor attached and independently observe both DyldLVBypass hook successes;
+9. re-check `process_generation`; any change invalidates all JIT evidence;
+10. terminate/return to launcher and collect the run artifact bundle.
 
-Any PID/process-generation change must force JIT re-establishment.
+Debugger attachment alone is not a PASS. Any PID/process-generation change forces JIT re-establishment.
 
 ## Gate B — Minecraft smoke
 
 `amethystctl run smoke --profile directmetal-26.2 --target WORLD_READY`
 
-Acceptance requires a single run artifact proving each reached stage. No manual taps and no fixed sleep may be used as readiness evidence. If the Fabric lab probe is not yet installed/wired, `WORLD_READY` must remain unproven rather than inferred from a screenshot.
+Acceptance requires a single run artifact proving each reached stage. No manual taps and no fixed sleep may be used as readiness evidence. If the version-specific Fabric/Minecraft lab adapter is not installed/wired, `WORLD_READY` remains unproven rather than inferred from a screenshot.
 
 ## Gate C — graphics correctness
 
