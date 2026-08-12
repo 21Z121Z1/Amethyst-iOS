@@ -138,6 +138,7 @@ add_executable(AngelAuraAmethyst
 
   AccountListViewController.m
   AgentControl.m
+  AgentPayload.m
   AppDelegate.m
   CustomControlsViewController.m
   CustomControlsViewController+UndoManager.m
