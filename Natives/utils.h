@@ -38,6 +38,9 @@
 #define RENDERER_NAME_MTL_ANGLE "libtinygl4angle.dylib"
 #define RENDERER_NAME_MOBILEGLUES "libmobileglues.dylib"
 #define RENDERER_NAME_VK_ZINK "libOSMesa.8.dylib"
+// Mithril-Wrapper: OpenGL 3.3 Core -> native Metal. Mithril exports its
+// own EGL entry points and therefore must be resolved from its own handle.
+#define RENDERER_NAME_MITHRIL "libmithril.dylib"
 
 #define SPECIALBTN_KEYBOARD -1
 #define SPECIALBTN_TOGGLECTRL -2
@@ -118,9 +121,3 @@ void CallbackBridge_nativeSetInputReady(BOOL inputReady);
 BOOL CallbackBridge_nativeSendChar(jchar codepoint /* jint codepoint */);
 BOOL CallbackBridge_nativeSendCharMods(jchar codepoint, int mods);
 void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y);
-void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods);
-void CallbackBridge_nativeSendMouseButton(int button, int action, int mods);
-void CallbackBridge_nativeSendScreenSize(int width, int height);
-void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset);
-void CallbackBridge_sendKeycode(int keycode, jchar keychar, int scancode, int modifiers, BOOL isDown);
-void CallbackBridge_pauseGameIfNeed();
