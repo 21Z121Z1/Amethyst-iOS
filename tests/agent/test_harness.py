@@ -5,10 +5,12 @@ import socket
 import tempfile
 import unittest
 from pathlib import Path
+from zipfile import ZipFile
 
-from tools.amethystd.container_io import documents_path, safe_component
+from tools.amethystd.container_io import AgentContainerClient, documents_path, safe_component
 from tools.amethystd.jit import JITSession
 from tools.amethystd.model import FailureClass, RunState, Stage
+from tools.amethystd.runtime_contract import verify_contract
 from tools.amethystd.store import StateStore
 from tools.amethystd.supervisor import Supervisor
 
@@ -64,6 +66,10 @@ class ContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 documents_path(bad)
 
+    def test_jsonl_parser_ignores_blank_lines(self) -> None:
+        rows = AgentContainerClient._jsonl(b'{"event":"one"}\n\n{"event":"two"}\n')
+        self.assertEqual([row["event"] for row in rows], ["one", "two"])
+
     def test_jit_markers_require_all_positive_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "jit.log"
@@ -86,6 +92,34 @@ class ContractTests(unittest.TestCase):
         self.assertNotEqual(Supervisor.event_key(first), Supervisor.event_key(second))
         explicit = {"event_id": "evt-1", "process_generation": "gen-a", "seq": 1}
         self.assertEqual(Supervisor.event_key(explicit), ("event_id", "evt-1"))
+
+    def test_runtime_contract_catches_missing_inner_class(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jar = root / "agent.jar"
+            with ZipFile(jar, "w") as archive:
+                archive.writestr("example/Agent.class", b"outer")
+            manifest = root / "contract.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "archives": [
+                            {
+                                "path": "agent.jar",
+                                "required_entries": ["example/Agent.class", "example/Agent$1.class"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = verify_contract(manifest)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["failures"][0]["reason"], "archive_entries_missing")
+            with ZipFile(jar, "a") as archive:
+                archive.writestr("example/Agent$1.class", b"inner")
+            self.assertTrue(verify_contract(manifest)["ok"])
 
 
 if __name__ == "__main__":

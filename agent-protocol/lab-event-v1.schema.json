@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amethyst.invalid/agent-protocol/lab-event-v1.schema.json",
+  "title": "Amethyst Minecraft lab event",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["protocol", "run_id", "event_id", "event", "timestamp_ms"],
+  "properties": {
+    "protocol": { "const": "amethyst-lab/v1" },
+    "run_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
+    "event_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "event": {
+      "enum": [
+        "jvm_ready",
+        "minecraft_bootstrap",
+        "renderer_loading",
+        "renderer_ready",
+        "menu_ready",
+        "world_loading",
+        "world_ready",
+        "chunks_stable",
+        "benchmark_warmup_started",
+        "benchmark_started",
+        "benchmark_finished",
+        "failed"
+      ]
+    },
+    "timestamp_ms": { "type": "integer", "minimum": 0 }
+  }
+}
