@@ -10,6 +10,10 @@ import sys
 from pathlib import Path
 from time import monotonic, sleep
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from tools.amethystd.server import request_daemon
 from tools.amethystd.store import StateStore
 
@@ -39,7 +43,7 @@ def ensure_daemon(store: StateStore, *, start: bool) -> None:
             stdout=handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            cwd=Path(__file__).resolve().parents[1],
+            cwd=REPO_ROOT,
             env=os.environ.copy(),
         )
     deadline = monotonic() + 5
