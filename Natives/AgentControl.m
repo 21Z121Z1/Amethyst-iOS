@@ -20,15 +20,13 @@ static NSString *AgentActiveRunID;
 static uint64_t AgentEventSequence;
 
 static NSString *AgentSafeIdentifier(NSString *value) {
-    if (value.length == 0) return nil;
-    NSMutableString *safe = [NSMutableString string];
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"];
-    for (NSUInteger i = 0; i < value.length && safe.length < 96; i++) {
-        unichar c = [value characterAtIndex:i];
-        if (![allowed characterIsMember:c]) return nil;
-        [safe appendFormat:@"%c", c];
+    if (value.length == 0 || value.length > 96) return nil;
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
+        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"];
+    for (NSUInteger i = 0; i < value.length; i++) {
+        if (![allowed characterIsMember:[value characterAtIndex:i]]) return nil;
     }
-    return safe.length == value.length ? safe : nil;
+    return value;
 }
 
 static NSString *AgentRequestID(NSString *requestID) {
@@ -61,13 +59,12 @@ static dispatch_queue_t AgentEventQueue(void) {
 
 static NSString *AgentDirectory(NSString *name) {
     NSString *home = AgentHomePath();
-    if (home.length == 0) return nil;
-    return [home stringByAppendingPathComponent:name];
+    return home.length ? [home stringByAppendingPathComponent:name] : nil;
 }
 
 static BOOL AgentEnsureDirectory(NSString *name) {
     NSString *path = AgentDirectory(name);
-    if (path.length == 0) return NO;
+    if (!path.length) return NO;
     NSError *error = nil;
     BOOL ok = [NSFileManager.defaultManager createDirectoryAtPath:path
                                       withIntermediateDirectories:YES
@@ -78,11 +75,12 @@ static BOOL AgentEnsureDirectory(NSString *name) {
 }
 
 static NSString *AgentResponsePath(NSString *requestID) {
-    NSString *directory = AgentDirectory(@"agent-responses");
-    return [directory stringByAppendingPathComponent:[AgentRequestID(requestID) stringByAppendingString:@".json"]];
+    return [AgentDirectory(@"agent-responses")
+        stringByAppendingPathComponent:[AgentRequestID(requestID) stringByAppendingString:@".json"]];
 }
 
 static BOOL AgentWriteJSON(NSDictionary *object, NSString *path) {
+    if (!path.length) return NO;
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingPrettyPrinted error:&error];
     if (!data || ![data writeToFile:path options:NSDataWritingAtomic error:&error]) {
@@ -92,30 +90,29 @@ static BOOL AgentWriteJSON(NSDictionary *object, NSString *path) {
     return YES;
 }
 
-static void AgentWriteResponseV1(NSString *requestID, NSDictionary *payload) {
+static void AgentWriteResponse(NSString *protocol, NSString *requestID, NSString *runID, NSDictionary *payload) {
     if (!AgentEnsureDirectory(@"agent-responses")) return;
     NSMutableDictionary *response = [payload mutableCopy] ?: [NSMutableDictionary dictionary];
-    response[@"protocol"] = @"amethyst-agent/v1";
+    response[@"protocol"] = protocol;
     response[@"request_id"] = AgentRequestID(requestID);
-    response[@"timestamp"] = @([NSDate.date timeIntervalSince1970]);
-    AgentWriteJSON(response, AgentResponsePath(requestID));
-}
-
-static void AgentWriteResponseV2(NSString *requestID, NSString *runID, NSDictionary *payload) {
-    if (!AgentEnsureDirectory(@"agent-responses")) return;
-    NSMutableDictionary *response = [payload mutableCopy] ?: [NSMutableDictionary dictionary];
-    response[@"protocol"] = @"amethyst-agent/v2";
-    response[@"request_id"] = AgentRequestID(requestID);
-    response[@"run_id"] = AgentSafeIdentifier(runID) ?: @"invalid";
     response[@"timestamp"] = @([NSDate.date timeIntervalSince1970]);
     response[@"process_id"] = @(getpid());
     response[@"process_generation"] = AgentProcessGeneration();
+    if ([protocol isEqualToString:@"amethyst-agent/v2"]) response[@"run_id"] = AgentSafeIdentifier(runID) ?: @"invalid";
     AgentWriteJSON(response, AgentResponsePath(requestID));
+}
+
+static void AgentWriteResponseV1(NSString *requestID, NSDictionary *payload) {
+    AgentWriteResponse(@"amethyst-agent/v1", requestID, nil, payload);
+}
+
+static void AgentWriteResponseV2(NSString *requestID, NSString *runID, NSDictionary *payload) {
+    AgentWriteResponse(@"amethyst-agent/v2", requestID, runID, payload);
 }
 
 static void AgentWriteEvent(NSString *runID, NSString *event, NSDictionary *payload) {
     NSString *safeRunID = AgentSafeIdentifier(runID);
-    if (safeRunID.length == 0 || event.length == 0) return;
+    if (!safeRunID.length || !event.length) return;
     dispatch_sync(AgentEventQueue(), ^{
         if (!AgentEnsureDirectory(@"agent-events")) return;
         NSMutableDictionary *record = [payload mutableCopy] ?: [NSMutableDictionary dictionary];
@@ -127,6 +124,7 @@ static void AgentWriteEvent(NSString *runID, NSString *event, NSDictionary *payl
         record[@"timestamp"] = @([NSDate.date timeIntervalSince1970]);
         record[@"process_id"] = @(getpid());
         record[@"process_generation"] = AgentProcessGeneration();
+
         NSError *error = nil;
         NSData *json = [NSJSONSerialization dataWithJSONObject:record options:0 error:&error];
         if (!json) {
@@ -135,9 +133,10 @@ static void AgentWriteEvent(NSString *runID, NSString *event, NSDictionary *payl
         }
         NSMutableData *line = [json mutableCopy];
         [line appendBytes:"\n" length:1];
-        NSString *path = [AgentDirectory(@"agent-events") stringByAppendingPathComponent:[safeRunID stringByAppendingString:@".jsonl"]];
+        NSString *path = [AgentDirectory(@"agent-events")
+            stringByAppendingPathComponent:[safeRunID stringByAppendingString:@".jsonl"]];
         if (![NSFileManager.defaultManager fileExistsAtPath:path]) {
-            [NSData.data writeToFile:path atomically:YES];
+            [[NSData data] writeToFile:path atomically:YES];
         }
         NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
         if (!handle) return;
@@ -154,11 +153,11 @@ static void AgentWriteEvent(NSString *runID, NSString *event, NSDictionary *payl
 }
 
 void AgentControlEmitActiveEvent(NSString *event, NSDictionary *payload) {
-    NSString *runID = nil;
+    NSString *runID;
     @synchronized (NSProcessInfo.processInfo) {
         runID = [AgentActiveRunID copy];
     }
-    if (runID.length > 0) AgentWriteEvent(runID, event, payload ?: @{});
+    if (runID.length) AgentWriteEvent(runID, event, payload ?: @{});
 }
 
 static void AgentSetActiveRunID(NSString *runID) {
@@ -170,7 +169,7 @@ static void AgentSetActiveRunID(NSString *runID) {
 static NSDictionary<NSString *, NSString *> *AgentQueryItems(NSURLComponents *components) {
     NSMutableDictionary *items = [NSMutableDictionary dictionary];
     for (NSURLQueryItem *item in components.queryItems ?: @[]) {
-        if (item.name.length > 0 && item.value.length > 0) items[item.name] = item.value;
+        if (item.name.length && item.value.length) items[item.name] = item.value;
     }
     return items;
 }
@@ -178,21 +177,22 @@ static NSDictionary<NSString *, NSString *> *AgentQueryItems(NSURLComponents *co
 static BOOL AgentBoolValue(id value, BOOL defaultValue) {
     if (!value || value == NSNull.null) return defaultValue;
     if ([value isKindOfClass:NSNumber.class]) return [value boolValue];
-    if (![value isKindOfClass:NSString.class] || [value length] == 0) return defaultValue;
+    if (![value isKindOfClass:NSString.class] || ![value length]) return defaultValue;
     return [@[@"1", @"true", @"yes", @"on"] containsObject:[value lowercaseString]];
 }
 
 static BOOL AgentSetGameDirectory(NSString *instance, NSString **errorMessage) {
-    if (instance.length == 0 || [instance isEqualToString:@"."] || [instance isEqualToString:@".."] ||
+    if (!instance.length || [instance isEqualToString:@"."] || [instance isEqualToString:@".."] ||
         [instance containsString:@"/"] || [instance containsString:@"\\"] || [instance containsString:@".."]) {
         if (errorMessage) *errorMessage = @"invalid instance name";
         return NO;
     }
     NSString *home = AgentHomePath();
-    if (home.length == 0) {
+    if (!home.length) {
         if (errorMessage) *errorMessage = @"POJAV_HOME is unavailable";
         return NO;
     }
+
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *instancePath = [home stringByAppendingPathComponent:[NSString stringWithFormat:@"instances/%@", instance]];
     BOOL isDirectory = NO;
@@ -204,6 +204,7 @@ static BOOL AgentSetGameDirectory(NSString *instance, NSString **errorMessage) {
         if (errorMessage) *errorMessage = @"cannot change instance while Minecraft is running";
         return NO;
     }
+
     NSString *gamePath = [home stringByAppendingPathComponent:@"Library/Application Support/minecraft"];
     struct stat gameStat;
     BOOL gamePathExists = lstat(gamePath.fileSystemRepresentation, &gameStat) == 0;
@@ -225,6 +226,7 @@ static BOOL AgentSetGameDirectory(NSString *instance, NSString **errorMessage) {
         if (errorMessage) *errorMessage = @"failed to change current directory";
         return NO;
     }
+
     setPrefObject(@"general.game_directory", instance);
     setenv("POJAV_GAME_DIR", gamePath.UTF8String, 1);
     [PLProfiles updateCurrent];
@@ -262,7 +264,7 @@ static NSDictionary *AgentRuntimeProbe(void) {
     NSMutableDictionary *result = [AgentStatus() mutableCopy];
     result[@"probe"] = @{
         @"kind": @"runtime",
-        @"pojav_home_available": @(AgentHomePath().length > 0),
+        @"pojav_home_available": @([AgentHomePath() length] > 0),
         @"game_surface_running": @(SurfaceViewController.isRunning),
     };
     return result;
@@ -293,7 +295,8 @@ static NSDictionary *AgentHandleAction(NSString *action, NSDictionary *params) {
     if ([action isEqualToString:@"terminate"]) {
         BOOL force = AgentBoolValue(params[@"force"], NO);
         if (!SurfaceViewController.isRunning) return @{ @"ok": @YES, @"state": @"already_in_launcher" };
-        NSDictionary *response = @{ @"ok": @YES, @"state": force ? @"app_exit_requested" : @"return_to_launcher_requested" };
+        NSDictionary *response = @{ @"ok": @YES,
+            @"state": force ? @"app_exit_requested" : @"return_to_launcher_requested" };
         if (force) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ exit(0); });
         } else {
@@ -311,17 +314,17 @@ static NSDictionary *AgentHandleAction(NSString *action, NSDictionary *params) {
 
     NSString *failure = nil;
     NSString *instance = [params[@"instance"] isKindOfClass:NSString.class] ? params[@"instance"] : nil;
-    if (instance.length > 0 && !AgentSetGameDirectory(instance, &failure)) {
+    if (instance.length && !AgentSetGameDirectory(instance, &failure)) {
         return @{ @"ok": @NO, @"state": @"profile_change_failed", @"error": failure ?: @"unknown error" };
     }
 
     NSString *profileName = [params[@"profile"] isKindOfClass:NSString.class] ? params[@"profile"] : nil;
     NSString *version = [params[@"version"] isKindOfClass:NSString.class] ? params[@"version"] : nil;
     PLProfiles *profiles = PLProfiles.current;
-    if (profileName.length == 0) profileName = profiles.selectedProfileName;
+    if (!profileName.length) profileName = profiles.selectedProfileName;
     NSMutableDictionary *profile = profiles.profiles[profileName];
     if (!profile) return @{ @"ok": @NO, @"state": @"profile_not_found", @"error": @"requested profile does not exist" };
-    if (version.length > 0) profile[@"lastVersionId"] = version;
+    if (version.length) profile[@"lastVersionId"] = version;
     profiles.selectedProfileName = profileName;
     [profiles save];
 
@@ -343,8 +346,8 @@ static void AgentProcessV2Envelope(NSDictionary *request, NSString *claimedReque
     NSString *runID = AgentSafeIdentifier([request[@"run_id"] isKindOfClass:NSString.class] ? request[@"run_id"] : nil);
     NSString *action = [request[@"action"] isKindOfClass:NSString.class] ? request[@"action"] : nil;
     NSDictionary *params = [request[@"params"] isKindOfClass:NSDictionary.class] ? request[@"params"] : @{};
-    if (![protocol isEqualToString:@"amethyst-agent/v2"] || requestID.length == 0 || runID.length == 0 ||
-        action.length == 0 || ![requestID isEqualToString:claimedRequestID]) {
+    if (![protocol isEqualToString:@"amethyst-agent/v2"] || !requestID.length || !runID.length ||
+        !action.length || ![requestID isEqualToString:claimedRequestID]) {
         AgentWriteResponseV2(claimedRequestID, runID ?: @"invalid", @{
             @"ok": @NO, @"state": @"rejected", @"error": @"invalid v2 request envelope"
         });
@@ -352,7 +355,7 @@ static void AgentProcessV2Envelope(NSDictionary *request, NSString *claimedReque
     }
 
     NSString *guard = [request[@"if_process_generation"] isKindOfClass:NSString.class] ? request[@"if_process_generation"] : nil;
-    if (guard.length > 0 && ![guard isEqualToString:AgentProcessGeneration()]) {
+    if (guard.length && ![guard isEqualToString:AgentProcessGeneration()]) {
         AgentWriteResponseV2(requestID, runID, @{
             @"ok": @NO, @"state": @"stale_process_generation", @"error": @"process generation changed"
         });
@@ -376,6 +379,7 @@ static void AgentProcessV2Envelope(NSDictionary *request, NSString *claimedReque
 }
 
 static BOOL AgentMoveReplacing(NSString *source, NSString *target) {
+    if (!source.length || !target.length) return NO;
     NSFileManager *fm = NSFileManager.defaultManager;
     [fm removeItemAtPath:target error:nil];
     NSError *error = nil;
@@ -385,15 +389,15 @@ static BOOL AgentMoveReplacing(NSString *source, NSString *target) {
 }
 
 static void AgentPollInbox(void) {
+    if (!AgentEnsureDirectory(@"agent-requests")) return;
     NSString *requestDir = AgentDirectory(@"agent-requests");
     NSString *processingDir = AgentDirectory(@"agent-processing");
     NSString *processedDir = AgentDirectory(@"agent-processed");
-    if (![AgentEnsureDirectory(@"agent-requests") boolValue]) return;
     NSArray<NSString *> *files = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:requestDir error:nil]
         sortedArrayUsingSelector:@selector(compare:)];
-    NSUInteger processed = 0;
+    NSUInteger count = 0;
     for (NSString *file in files) {
-        if (processed >= 8 || ![file hasSuffix:@".json"]) continue;
+        if (count >= 8 || ![file hasSuffix:@".json"]) continue;
         NSString *requestID = [file stringByDeletingPathExtension];
         if (![[AgentSafeIdentifier(requestID) ?: @""] isEqualToString:requestID]) continue;
         NSString *source = [requestDir stringByAppendingPathComponent:file];
@@ -401,39 +405,37 @@ static void AgentPollInbox(void) {
         NSString *done = [processedDir stringByAppendingPathComponent:file];
         if ([NSFileManager.defaultManager fileExistsAtPath:AgentResponsePath(requestID)]) {
             AgentMoveReplacing(source, done);
-            processed++;
+            count++;
             continue;
         }
         if (!AgentMoveReplacing(source, claimed)) continue;
         NSData *data = [NSData dataWithContentsOfFile:claimed];
         NSError *error = nil;
-        NSDictionary *request = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&error] : nil;
-        if (![request isKindOfClass:NSDictionary.class]) {
+        id object = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&error] : nil;
+        if (![object isKindOfClass:NSDictionary.class]) {
             AgentWriteResponseV2(requestID, @"invalid", @{
                 @"ok": @NO, @"state": @"rejected", @"error": error.localizedDescription ?: @"invalid JSON request"
             });
         } else {
-            AgentProcessV2Envelope(request, requestID);
+            AgentProcessV2Envelope((NSDictionary *)object, requestID);
         }
         AgentMoveReplacing(claimed, done);
-        processed++;
+        count++;
     }
 }
 
 static void AgentRecoverProcessing(void) {
-    AgentEnsureDirectory(@"agent-requests");
-    AgentEnsureDirectory(@"agent-responses");
-    AgentEnsureDirectory(@"agent-events");
-    AgentEnsureDirectory(@"agent-processing");
-    AgentEnsureDirectory(@"agent-processed");
+    for (NSString *directory in @[@"agent-requests", @"agent-responses", @"agent-events", @"agent-processing", @"agent-processed"]) {
+        AgentEnsureDirectory(directory);
+    }
     NSString *processingDir = AgentDirectory(@"agent-processing");
     for (NSString *file in [NSFileManager.defaultManager contentsOfDirectoryAtPath:processingDir error:nil] ?: @[]) {
         if (![file hasSuffix:@".json"]) continue;
         NSString *requestID = [file stringByDeletingPathExtension];
         NSString *source = [processingDir stringByAppendingPathComponent:file];
-        NSString *targetDirectory = [NSFileManager.defaultManager fileExistsAtPath:AgentResponsePath(requestID)]
+        NSString *targetDir = [NSFileManager.defaultManager fileExistsAtPath:AgentResponsePath(requestID)]
             ? AgentDirectory(@"agent-processed") : AgentDirectory(@"agent-requests");
-        AgentMoveReplacing(source, [targetDirectory stringByAppendingPathComponent:file]);
+        AgentMoveReplacing(source, [targetDir stringByAppendingPathComponent:file]);
     }
 }
 
@@ -443,7 +445,9 @@ void AgentControlStart(void) {
         AgentRecoverProcessing();
         AgentInboxTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         dispatch_source_set_timer(AgentInboxTimer,
-            dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), 250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+            dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+            250 * NSEC_PER_MSEC,
+            50 * NSEC_PER_MSEC);
         dispatch_source_set_event_handler(AgentInboxTimer, ^{ AgentPollInbox(); });
         dispatch_resume(AgentInboxTimer);
         NSLog(@"[AgentControl] v2 inbox started for process generation %@", AgentProcessGeneration());
@@ -455,13 +459,18 @@ static void AgentProcessURL(NSURL *url) {
     NSDictionary *query = AgentQueryItems(components);
     NSString *requestID = AgentRequestID(query[@"request_id"]);
     if (![components.scheme.lowercaseString isEqualToString:@"amethyst"] ||
-        ![components.host.lowercaseString isEqualToString:@"agent"] || ![components.path hasPrefix:@"/v1/"]) {
-        AgentWriteResponseV1(requestID, @{ @"ok": @NO, @"state": @"rejected", @"error": @"unsupported agent URL" });
+        ![components.host.lowercaseString isEqualToString:@"agent"] ||
+        ![components.path hasPrefix:@"/v1/"]) {
+        AgentWriteResponseV1(requestID, @{
+            @"ok": @NO, @"state": @"rejected", @"error": @"unsupported agent URL"
+        });
         return;
     }
     NSString *action = [components.path substringFromIndex:@"/v1/".length];
     NSMutableDictionary *params = [NSMutableDictionary dictionary];
-    for (NSString *key in @[@"profile", @"version", @"instance"]) if (query[key]) params[key] = query[key];
+    for (NSString *key in @[@"profile", @"version", @"instance"]) {
+        if (query[key]) params[key] = query[key];
+    }
     if (query[@"force"]) params[@"force"] = @(AgentBoolValue(query[@"force"], NO));
     AgentWriteResponseV1(requestID, AgentHandleAction(action, params));
 }
