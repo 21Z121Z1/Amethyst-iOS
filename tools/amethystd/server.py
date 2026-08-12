@@ -21,14 +21,30 @@ class AgentServer:
     async def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         method = request.get("method")
         params = request.get("params") or {}
+        if method == "ping":
+            return {"ok": True, "daemon": "amethystd"}
         if method == "doctor":
             return self.supervisor.doctor()
         if method == "status":
             return self.supervisor.status()
+        if method == "deploy":
+            return await self.supervisor.deploy(**params)
         if method == "run_smoke":
-            return await self.supervisor.run_smoke(**params)
+            result = await self.supervisor.run_smoke(**params)
+            state = result.get("state") or {}
+            run_id = state.get("run_id")
+            if isinstance(run_id, str) and run_id:
+                collection = await self.supervisor.collect(
+                    run_id,
+                    include_crashes=not bool(result.get("ok")),
+                    screenshot=True,
+                )
+                result["artifacts"] = collection
+            return result
         if method == "stage_payload":
             return await self.supervisor.stage_payload(**params)
+        if method == "collect":
+            return await self.supervisor.collect(**params)
         if method == "shutdown":
             self._stop.set()
             return {"ok": True, "stopping": True}
