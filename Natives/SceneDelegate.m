@@ -1,4 +1,5 @@
 #import "SceneDelegate.h"
+#import "AgentControl.h"
 #import "ios_uikit_bridge.h"
 #import "utils.h"
 
@@ -18,6 +19,15 @@ extern UIWindow *mainWindow;
     mainWindow = self.window;
     launchInitialViewController(self.window);
     [self.window makeKeyAndVisible];
+    for (UIOpenURLContext *context in connectionOptions.URLContexts) {
+        AgentControlHandleURL(context.URL);
+    }
+}
+
+- (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
+    for (UIOpenURLContext *context in URLContexts) {
+        AgentControlHandleURL(context.URL);
+    }
 }
 
 

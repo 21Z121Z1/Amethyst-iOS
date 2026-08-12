@@ -278,6 +278,19 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     UIApplication.sharedApplication.idleTimerDisabled = !enabled;
 }
 
+- (BOOL)agentLaunchWithError:(NSString **)errorMessage {
+    if (BaseAuthenticator.current == nil) {
+        if (errorMessage) *errorMessage = @"no Minecraft account is selected";
+        return NO;
+    }
+    if (!self.versionTextField.hasText) {
+        if (errorMessage) *errorMessage = @"selected profile has no launch version";
+        return NO;
+    }
+    [self performInstallOrShowDetails:self.buttonInstall ?: self.buttonInstallItem];
+    return YES;
+}
+
 - (void)launchMinecraft:(UIButton *)sender {
     if (!self.versionTextField.hasText) {
         [self.versionTextField becomeFirstResponder];
