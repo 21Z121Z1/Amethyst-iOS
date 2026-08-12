@@ -1,0 +1,2 @@
+# Host physical-device dependency. The harness itself and its CI unit tests use only stdlib.
+pymobiledevice3>=10.0,<11

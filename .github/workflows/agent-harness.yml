@@ -1,0 +1,36 @@
+name: Agent harness
+
+on:
+  push:
+    branches-ignore: [l10n_main]
+    paths:
+      - 'tools/amethystd/**'
+      - 'tools/amethystctl.py'
+      - 'tests/agent/**'
+      - 'agent-protocol/**'
+      - 'AGENTS.md'
+      - 'WORKFLOW.md'
+      - '.github/workflows/agent-harness.yml'
+  pull_request:
+    paths:
+      - 'tools/amethystd/**'
+      - 'tools/amethystctl.py'
+      - 'tests/agent/**'
+      - 'agent-protocol/**'
+      - 'AGENTS.md'
+      - 'WORKFLOW.md'
+      - '.github/workflows/agent-harness.yml'
+  workflow_dispatch:
+
+jobs:
+  contract-tests:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile host harness
+        run: python3 -m compileall -q tools/amethystd tools/amethystctl.py
+      - name: Run host harness tests
+        run: python3 -m unittest discover -s tests/agent -v
+      - name: Verify CLI parses without device dependencies
+        run: python3 tools/amethystctl.py --help >/dev/null
