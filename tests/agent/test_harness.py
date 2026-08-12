@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import socket
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.amethystd.container_io import safe_component
+from tools.amethystd.container_io import documents_path, safe_component
 from tools.amethystd.jit import JITSession
 from tools.amethystd.model import FailureClass, RunState, Stage
 from tools.amethystd.store import StateStore
+from tools.amethystd.supervisor import Supervisor
 
 
 class RunStateTests(unittest.TestCase):
@@ -56,6 +58,12 @@ class ContractTests(unittest.TestCase):
                 safe_component(bad, "id")
         self.assertEqual(safe_component("run_ABC-123", "id"), "run_ABC-123")
 
+    def test_documents_path_is_rooted_and_rejects_escape(self) -> None:
+        self.assertEqual(documents_path("agent-requests/a.json"), "/Documents/agent-requests/a.json")
+        for bad in ("../x", "/absolute"):
+            with self.assertRaises(ValueError):
+                documents_path(bad)
+
     def test_jit_markers_require_all_positive_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "jit.log"
@@ -63,6 +71,21 @@ class ContractTests(unittest.TestCase):
             self.assertFalse(JITSession._contains_all(path, ("Got JIT mapping", "mapping at RW=")))
             path.write_text("Got JIT mapping\nmapping at RW=0x1 RX=0x2\n", encoding="utf-8")
             self.assertTrue(JITSession._contains_all(path, ("Got JIT mapping", "mapping at RW=")))
+
+    def test_listener_probe_does_not_connect(self) -> None:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            listener.listen(1)
+            self.assertTrue(JITSession._port_is_claimed(port))
+        self.assertFalse(JITSession._port_is_claimed(port))
+
+    def test_event_identity_survives_sequence_reset(self) -> None:
+        first = {"process_generation": "gen-a", "seq": 1}
+        second = {"process_generation": "gen-b", "seq": 1}
+        self.assertNotEqual(Supervisor.event_key(first), Supervisor.event_key(second))
+        explicit = {"event_id": "evt-1", "process_generation": "gen-a", "seq": 1}
+        self.assertEqual(Supervisor.event_key(explicit), ("event_id", "evt-1"))
 
 
 if __name__ == "__main__":

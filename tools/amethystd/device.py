@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import shlex
 import shutil
@@ -15,10 +16,11 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0
+        return self.returncode == 0 and not self.timed_out
 
 
 class CommandRunner:
@@ -32,16 +34,22 @@ class CommandRunner:
         merged = os.environ.copy()
         if env:
             merged.update(env)
-        proc = subprocess.run(
-            list(argv),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            env=merged,
-            check=False,
-        )
-        return CommandResult(list(argv), proc.returncode, proc.stdout, proc.stderr)
+        command = list(argv)
+        try:
+            proc = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                env=merged,
+                check=False,
+            )
+            return CommandResult(command, proc.returncode, proc.stdout, proc.stderr)
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            return CommandResult(command, 124, stdout, stderr, timed_out=True)
 
 
 class DeviceController:
@@ -62,20 +70,34 @@ class DeviceController:
             return [uvx, "pymobiledevice3"]
         return []
 
+    @staticmethod
+    def pmd3_python_api_available() -> bool:
+        return importlib.util.find_spec("pymobiledevice3") is not None
+
     def pmd3_env(self) -> dict[str, str]:
         return {"PYMOBILEDEVICE3_UDID": self.udid} if self.udid else {}
 
     def doctor(self) -> dict:
         prefix = self.pmd3_prefix()
         result: dict = {
-            "pymobiledevice3": {"available": bool(prefix), "command": prefix},
+            "pymobiledevice3": {
+                "available": bool(prefix),
+                "python_api_available": self.pmd3_python_api_available(),
+                "command": prefix,
+            },
             "devicectl": {"available": bool(shutil.which("xcrun"))},
             "configured_udid": self.udid,
         }
         if prefix:
             probe = self.runner.run([*prefix, "usbmux", "list"], timeout=20, env=self.pmd3_env())
             result["pymobiledevice3"].update(
-                {"ok": probe.ok, "stdout": probe.stdout, "stderr": probe.stderr, "returncode": probe.returncode}
+                {
+                    "ok": probe.ok,
+                    "stdout": probe.stdout,
+                    "stderr": probe.stderr,
+                    "returncode": probe.returncode,
+                    "timed_out": probe.timed_out,
+                }
             )
         return result
 
@@ -95,6 +117,16 @@ class DeviceController:
         return self.runner.run(
             ["xcrun", "devicectl", "device", "install", "app", "--device", self.udid, str(app_path)],
             timeout=float(os.environ.get("AMETHYST_INSTALL_TIMEOUT", "300")),
+        )
+
+    def query_app(self, bundle_id: str) -> CommandResult:
+        prefix = self.pmd3_prefix()
+        if not prefix:
+            raise RuntimeError("pymobiledevice3 is unavailable")
+        return self.runner.run(
+            [*prefix, "apps", "query", bundle_id],
+            timeout=30,
+            env=self.pmd3_env(),
         )
 
     def pull_crashes(self, target: Path) -> CommandResult:

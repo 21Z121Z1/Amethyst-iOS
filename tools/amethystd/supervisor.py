@@ -9,7 +9,13 @@ from uuid import uuid4
 
 from .container_io import AgentContainerClient
 from .device import DeviceController
-from .jit import DyldVerificationError, JITProcessorUnconfigured, JITSession, JITVerificationError
+from .jit import (
+    DyldVerificationError,
+    JITProcessorUnconfigured,
+    JITSession,
+    JITVerificationError,
+    StaleDebugserverError,
+)
 from .model import FailureClass, RunState, Stage
 from .store import StateStore
 
@@ -44,8 +50,14 @@ class Supervisor:
 
     def doctor(self) -> dict[str, Any]:
         device = self.device.doctor()
+        pmd3 = device["pymobiledevice3"]
         return {
-            "ok": bool(device["pymobiledevice3"]["available"] and device["devicectl"]["available"]),
+            "ok": bool(
+                pmd3["available"]
+                and pmd3["python_api_available"]
+                and device["devicectl"]["available"]
+                and pmd3.get("ok", False)
+            ),
             "bundle_id": self.bundle_id,
             "device": device,
             "jit_processor_configured": bool(os.environ.get("AMETHYST_JIT_PROCESSOR")),
@@ -105,6 +117,17 @@ class Supervisor:
             raise RuntimeError("Agent v2 response did not provide process_id/process_generation")
         return state.observe_process(pid, generation)
 
+    @staticmethod
+    def event_key(event: dict[str, Any]) -> tuple[str, str] | tuple[str, str, int] | None:
+        event_id = event.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            return ("event_id", event_id)
+        generation = event.get("process_generation")
+        seq = event.get("seq")
+        if isinstance(generation, str) and generation and isinstance(seq, int):
+            return ("generation_seq", generation, seq)
+        return None
+
     async def run_smoke(
         self,
         *,
@@ -117,8 +140,19 @@ class Supervisor:
         state = self._new_state(run_id)
         try:
             doctor = self.doctor()
-            if not doctor["device"]["pymobiledevice3"]["available"] or not doctor["device"]["devicectl"]["available"]:
+            pmd3 = doctor["device"]["pymobiledevice3"]
+            if not pmd3["available"] or not doctor["device"]["devicectl"]["available"]:
                 state.fail(FailureClass.DEVICE_NOT_FOUND, "required host device tooling is unavailable", blocked=True)
+                return self._finish(state)
+            if not pmd3["python_api_available"]:
+                state.fail(
+                    FailureClass.AGENT_UNREACHABLE,
+                    "amethystd Python environment lacks pymobiledevice3; install requirements-agent.txt in the daemon environment",
+                    blocked=True,
+                )
+                return self._finish(state)
+            if not pmd3.get("ok", False):
+                state.fail(FailureClass.DEVICE_NOT_FOUND, "pymobiledevice3 usbmux probe did not succeed", blocked=True)
                 return self._finish(state)
             if not self.device_udid:
                 state.fail(FailureClass.DEVICE_NOT_FOUND, "explicit device UDID is required for unattended state changes", blocked=True)
@@ -128,7 +162,12 @@ class Supervisor:
 
             launch = await asyncio.to_thread(self.device.launch_app, self.bundle_id)
             self.store.append_event(
-                state.run_id, "app_launch_command", returncode=launch.returncode, stdout=launch.stdout, stderr=launch.stderr
+                state.run_id,
+                "app_launch_command",
+                returncode=launch.returncode,
+                stdout=launch.stdout,
+                stderr=launch.stderr,
+                timed_out=launch.timed_out,
             )
             if not launch.ok:
                 state.fail(FailureClass.AGENT_UNREACHABLE, f"devicectl launch failed: {launch.stderr.strip()}")
@@ -161,6 +200,9 @@ class Supervisor:
                 )
             except JITProcessorUnconfigured as exc:
                 state.fail(FailureClass.JIT_PROCESSOR_UNCONFIGURED, str(exc), blocked=True)
+                return self._finish(state)
+            except StaleDebugserverError as exc:
+                state.fail(FailureClass.STALE_DEBUGSERVER, str(exc))
                 return self._finish(state)
             except DyldVerificationError as exc:
                 state.fail(FailureClass.DYLD_VALIDATION_FAILURE, str(exc))
@@ -203,15 +245,34 @@ class Supervisor:
                 state.transition(Stage.PASS, target=wanted.value)
                 return self._finish(state)
             deadline = monotonic() + timeout
-            seen_seq: set[int] = set()
+            seen_events: set[tuple] = set()
             while monotonic() < deadline:
                 events = await client.read_events(state.run_id)
                 for event in events:
-                    seq = event.get("seq")
-                    if isinstance(seq, int) and seq in seen_seq:
+                    key = self.event_key(event)
+                    if key is not None and key in seen_events:
                         continue
-                    if isinstance(seq, int):
-                        seen_seq.add(seq)
+                    if key is not None:
+                        seen_events.add(key)
+
+                    event_generation = event.get("process_generation")
+                    event_pid = event.get("process_id")
+                    if isinstance(event_generation, str) and isinstance(event_pid, int):
+                        if state.observe_process(event_pid, event_generation):
+                            self.store.append_event(
+                                state.run_id,
+                                "process_generation_changed",
+                                process_id=event_pid,
+                                process_generation=event_generation,
+                            )
+                            if self.jit:
+                                self.jit.close()
+                            state.fail(
+                                FailureClass.JIT_VERIFICATION_FAILURE,
+                                "Amethyst process generation changed after launch; JIT proof was invalidated",
+                            )
+                            return self._finish(state)
+
                     event_name = event.get("event") or event.get("stage")
                     mapped = EVENT_TO_STAGE.get(event_name)
                     if mapped:
@@ -237,6 +298,12 @@ class Supervisor:
     async def stage_payload(self, local_path: str, name: str) -> dict[str, Any]:
         if not self.device_udid:
             return {"ok": False, "failure": FailureClass.DEVICE_NOT_FOUND.value, "detail": "device UDID is required"}
+        if not self.device.pmd3_python_api_available():
+            return {
+                "ok": False,
+                "failure": FailureClass.AGENT_UNREACHABLE.value,
+                "detail": "amethystd Python environment lacks pymobiledevice3",
+            }
         client = AgentContainerClient(self.device_udid, self.bundle_id)
         manifest = await client.stage_payload(local_path, name)
         return {"ok": True, "manifest": manifest}
