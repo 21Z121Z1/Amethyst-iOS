@@ -16,9 +16,32 @@ from .supervisor import Supervisor
 class AgentServer:
     def __init__(self, store: StateStore | None = None) -> None:
         self.store = store or StateStore()
-        self.supervisor = Supervisor(self.store)
+        self.supervisor = self._new_supervisor()
         self.server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
+
+    def _new_supervisor(self) -> Supervisor:
+        config = self.store.load_config()
+        return Supervisor(
+            self.store,
+            device_udid=config.get("device_udid"),
+            bundle_id=config.get("bundle_id"),
+        )
+
+    def _configure(self, *, device_udid: str | None = None, bundle_id: str | None = None) -> dict[str, Any]:
+        current = self.store.load_config()
+        if device_udid is not None:
+            current["device_udid"] = device_udid
+        if bundle_id is not None:
+            current["bundle_id"] = bundle_id
+        self.store.save_config(current)
+        self.supervisor.close()
+        self.supervisor = self._new_supervisor()
+        return {
+            "ok": True,
+            "configuration": self.store.load_config(),
+            "note": "device identifiers are local-only under .amethyst-agent and are not versioned",
+        }
 
     async def _stop_current(self, force: bool = False, timeout: float = 30) -> dict[str, Any]:
         state = self.store.load()
@@ -76,6 +99,8 @@ class AgentServer:
         params = request.get("params") or {}
         if method == "ping":
             return {"ok": True, "daemon": "amethystd"}
+        if method == "configure":
+            return self._configure(**params)
         if method == "doctor":
             return self.supervisor.doctor()
         if method == "status":
