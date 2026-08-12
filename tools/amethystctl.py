@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tools.amethystd.debug_package import build_agent_debug_ipa
 from tools.amethystd.runtime_contract import verify_contract
 from tools.amethystd.server import request_daemon
 from tools.amethystd.store import StateStore
@@ -74,17 +75,48 @@ def ensure_daemon(store: StateStore, *, start: bool) -> None:
     raise RuntimeError(f"amethystd did not become healthy; see {log}")
 
 
+def configure_local(store: StateStore, *, device_udid: str | None, bundle_id: str | None) -> dict:
+    current = store.load_config()
+    if device_udid:
+        current["device_udid"] = device_udid
+    if bundle_id:
+        current["bundle_id"] = bundle_id
+    store.save_config(current)
+    if daemon_healthy(store):
+        return asyncio.run(call("configure", {"device_udid": device_udid, "bundle_id": bundle_id}))
+    return {"ok": True, "configuration": store.load_config(), "daemon_reconfigure_pending": True}
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="amethystctl")
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
     sub.add_parser("status")
 
+    configure = sub.add_parser("configure")
+    configure.add_argument("--device", dest="device_udid")
+    configure.add_argument("--bundle-id")
+
     daemon = sub.add_parser("daemon")
     daemon.add_argument("action", choices=["start", "stop", "status"])
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("app", help="Development-signed .app directory or .ipa")
+
+    agent_debug = sub.add_parser("agent-debug")
+    agent_debug_sub = agent_debug.add_subparsers(dest="agent_debug_action", required=True)
+    package = agent_debug_sub.add_parser("package")
+    package.add_argument("--base-ipa", required=True)
+    package.add_argument("--profile", required=True, help="Apple Development .mobileprovision")
+    package.add_argument("--bundle-id")
+    package.add_argument("--device", dest="device_udid")
+    package.add_argument("--identity", help="Apple Development identity; auto-select only when exactly one exists")
+    package.add_argument("--native-binary", help="Use an already-built AngelAuraAmethyst Mach-O")
+    package.add_argument("--output", default="artifacts/Amethyst-AgentDebug.ipa")
+    package.add_argument("--display-name", default="Amethyst AgentDebug")
+    package.add_argument("--jobs", type=int, default=2)
+    package.add_argument("--allow-production-bundle", action="store_true")
+    package.add_argument("--deploy", action="store_true")
 
     stop = sub.add_parser("stop")
     stop.add_argument("--force", action="store_true")
@@ -122,6 +154,47 @@ def main() -> int:
     try:
         if args.command == "runtime" and args.runtime_action == "verify":
             return emit(verify_contract(args.manifest))
+
+        if args.command == "configure":
+            if not args.device_udid and not args.bundle_id:
+                return emit({"ok": True, "configuration": store.load_config()})
+            return emit(configure_local(store, device_udid=args.device_udid, bundle_id=args.bundle_id))
+
+        if args.command == "agent-debug" and args.agent_debug_action == "package":
+            config = store.load_config()
+            bundle_id = args.bundle_id or os.environ.get("AMETHYST_BUNDLE_ID") or config.get("bundle_id")
+            device_udid = args.device_udid or os.environ.get("AMETHYST_DEVICE_UDID") or config.get("device_udid")
+            if not bundle_id:
+                raise ValueError("AgentDebug packaging requires --bundle-id, AMETHYST_BUNDLE_ID, or saved configuration")
+            result = build_agent_debug_ipa(
+                repo_root=REPO_ROOT,
+                base_ipa=Path(args.base_ipa),
+                profile_path=Path(args.profile),
+                bundle_id=bundle_id,
+                output=Path(args.output),
+                identity=args.identity,
+                device_udid=device_udid,
+                native_binary=Path(args.native_binary) if args.native_binary else None,
+                display_name=args.display_name,
+                jobs=args.jobs,
+                allow_production_bundle=args.allow_production_bundle,
+            ).to_dict()
+            if not args.deploy:
+                return emit(result)
+            if not device_udid:
+                raise ValueError("--deploy requires --device, AMETHYST_DEVICE_UDID, or saved configuration")
+            configure_local(store, device_udid=device_udid, bundle_id=bundle_id)
+            ensure_daemon(store, start=True)
+            asyncio.run(call("configure", {"device_udid": device_udid, "bundle_id": bundle_id}))
+            deployment = asyncio.run(call("deploy", {"app_path": result["output"]}))
+            combined = {
+                "ok": bool(deployment.get("ok")),
+                "package": result,
+                "deploy": deployment,
+            }
+            if not combined["ok"]:
+                combined["failure"] = deployment.get("failure", "INSTALL_UNKNOWN")
+            return emit(combined)
 
         if args.command == "daemon":
             if args.action == "start":
