@@ -54,6 +54,17 @@ class AgentContainerClient:
             ) as afc:
                 yield afc
 
+    async def read_optional(self, relative: str) -> bytes | None:
+        try:
+            from pymobiledevice3.exceptions import AfcFileNotFoundError
+        except ImportError as exc:
+            raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
+        async with self._afc() as afc:
+            try:
+                return await afc.get_file_contents(documents_path(relative))
+            except AfcFileNotFoundError:
+                return None
+
     async def submit(self, request: dict[str, Any]) -> str:
         request_id = safe_component(str(request["request_id"]), "request_id")
         run_id = safe_component(str(request["run_id"]), "run_id")
@@ -72,15 +83,9 @@ class AgentContainerClient:
 
     async def response(self, request_id: str) -> dict[str, Any] | None:
         request_id = safe_component(request_id, "request_id")
-        try:
-            from pymobiledevice3.exceptions import AfcFileNotFoundError
-        except ImportError as exc:
-            raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
-        async with self._afc() as afc:
-            try:
-                raw = await afc.get_file_contents(documents_path(f"agent-responses/{request_id}.json"))
-            except AfcFileNotFoundError:
-                return None
+        raw = await self.read_optional(f"agent-responses/{request_id}.json")
+        if raw is None:
+            return None
         value = json.loads(raw.decode("utf-8"))
         if value.get("request_id") != request_id:
             raise RuntimeError("response/request_id mismatch")
@@ -98,21 +103,47 @@ class AgentContainerClient:
             delay = min(delay * 1.4, 0.5)
         raise TimeoutError(f"agent response timeout for {request_id}")
 
-    async def read_events(self, run_id: str) -> list[dict[str, Any]]:
-        run_id = safe_component(run_id, "run_id")
-        try:
-            from pymobiledevice3.exceptions import AfcFileNotFoundError
-        except ImportError as exc:
-            raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
-        async with self._afc() as afc:
-            try:
-                raw = await afc.get_file_contents(documents_path(f"agent-events/{run_id}.jsonl"))
-            except AfcFileNotFoundError:
-                return []
+    @staticmethod
+    def _jsonl(raw: bytes | None) -> list[dict[str, Any]]:
+        if raw is None:
+            return []
         events: list[dict[str, Any]] = []
         for line in raw.decode("utf-8", errors="replace").splitlines():
             if line.strip():
-                events.append(json.loads(line))
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    events.append(value)
+        return events
+
+    async def read_events(self, run_id: str) -> list[dict[str, Any]]:
+        run_id = safe_component(run_id, "run_id")
+        return self._jsonl(await self.read_optional(f"agent-events/{run_id}.jsonl"))
+
+    async def prepare_lab_run(self, run_id: str) -> None:
+        """Publish the active run without requiring an Objective-C -> Java bridge.
+
+        Test-only Java/Fabric instrumentation can read `${user.home}/agent-lab/current-run-id`,
+        then append its own events to `agent-lab/<run_id>.jsonl`.
+        """
+        run_id = safe_component(run_id, "run_id")
+        root = documents_path("agent-lab")
+        temp = documents_path(f"agent-lab/.current-run-{uuid4().hex}.tmp")
+        final = documents_path("agent-lab/current-run-id")
+        async with self._afc() as afc:
+            await afc.makedirs(root, exist_ok=True)
+            await afc.set_file_contents(temp, (run_id + "\n").encode())
+            try:
+                await afc.rm(final)
+            except Exception:
+                pass
+            await afc.rename(temp, final)
+
+    async def read_lab_events(self, run_id: str) -> list[dict[str, Any]]:
+        run_id = safe_component(run_id, "run_id")
+        events = self._jsonl(await self.read_optional(f"agent-lab/{run_id}.jsonl"))
+        for event in events:
+            if event.get("run_id") != run_id:
+                raise RuntimeError("lab event/run_id mismatch")
         return events
 
     async def stage_payload(self, local_path: Path | str, payload_name: str) -> dict[str, Any]:
