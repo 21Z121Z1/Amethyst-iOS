@@ -11,12 +11,20 @@ from typing import Any, AsyncIterator
 from uuid import uuid4
 
 _SAFE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
+_REMOTE_DOCUMENTS = "/Documents"
 
 
 def safe_component(value: str, label: str) -> str:
     if not _SAFE.fullmatch(value):
         raise ValueError(f"invalid {label}: {value!r}")
     return value
+
+
+def documents_path(relative: str) -> str:
+    path = PurePosixPath(relative)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"invalid Documents-relative path: {relative!r}")
+    return str(PurePosixPath(_REMOTE_DOCUMENTS) / path)
 
 
 class AgentContainerClient:
@@ -54,10 +62,10 @@ class AgentContainerClient:
         request["request_id"] = request_id
         request["run_id"] = run_id
         data = (json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        final_path = f"agent-requests/{request_id}.json"
-        temp_path = f"agent-requests/.{request_id}.{uuid4().hex}.tmp"
+        final_path = documents_path(f"agent-requests/{request_id}.json")
+        temp_path = documents_path(f"agent-requests/.{request_id}.{uuid4().hex}.tmp")
         async with self._afc() as afc:
-            await afc.makedirs("agent-requests", exist_ok=True)
+            await afc.makedirs(documents_path("agent-requests"), exist_ok=True)
             await afc.set_file_contents(temp_path, data)
             await afc.rename(temp_path, final_path)
         return request_id
@@ -70,7 +78,7 @@ class AgentContainerClient:
             raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
         async with self._afc() as afc:
             try:
-                raw = await afc.get_file_contents(f"agent-responses/{request_id}.json")
+                raw = await afc.get_file_contents(documents_path(f"agent-responses/{request_id}.json"))
             except AfcFileNotFoundError:
                 return None
         value = json.loads(raw.decode("utf-8"))
@@ -98,7 +106,7 @@ class AgentContainerClient:
             raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
         async with self._afc() as afc:
             try:
-                raw = await afc.get_file_contents(f"agent-events/{run_id}.jsonl")
+                raw = await afc.get_file_contents(documents_path(f"agent-events/{run_id}.jsonl"))
             except AfcFileNotFoundError:
                 return []
         events: list[dict[str, Any]] = []
@@ -126,7 +134,8 @@ class AgentContainerClient:
             digest.update(b"\0")
             digest.update(bytes.fromhex(sha))
         deployment_digest = digest.hexdigest()
-        stage_root = f"agent-payloads/.staging/{deployment_digest}"
+        stage_relative = f"agent-payloads/.staging/{deployment_digest}"
+        stage_root = documents_path(stage_relative)
         manifest = {
             "version": 1,
             "name": payload_name,
@@ -136,24 +145,24 @@ class AgentContainerClient:
         async with self._afc() as afc:
             await afc.makedirs(stage_root, exist_ok=True)
             for local, entry in zip(files, manifest_files, strict=True):
-                remote = f"{stage_root}/{entry['path']}"
-                parent = str(PurePosixPath(remote).parent)
-                await afc.makedirs(parent, exist_ok=True)
+                remote = str(PurePosixPath(stage_root) / entry["path"])
+                await afc.makedirs(str(PurePosixPath(remote).parent), exist_ok=True)
                 data = local.read_bytes()
                 await afc.set_file_contents(remote, data)
                 observed = await afc.get_file_contents(remote)
                 if len(observed) != entry["size"] or hashlib.sha256(observed).hexdigest() != entry["sha256"]:
                     raise IOError(f"payload verification failed for {entry['path']}")
             manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
-            await afc.set_file_contents(f"{stage_root}/manifest.json", manifest_data)
-            await afc.makedirs("agent-payloads/active", exist_ok=True)
+            await afc.set_file_contents(str(PurePosixPath(stage_root) / "manifest.json"), manifest_data)
+            active_root = documents_path("agent-payloads/active")
+            await afc.makedirs(active_root, exist_ok=True)
             pointer = json.dumps(
-                {"name": payload_name, "digest": deployment_digest, "stage": stage_root},
+                {"name": payload_name, "digest": deployment_digest, "stage": stage_relative},
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
-            temp = f"agent-payloads/active/.{payload_name}.{uuid4().hex}.tmp"
-            final = f"agent-payloads/active/{payload_name}.json"
+            temp = str(PurePosixPath(active_root) / f".{payload_name}.{uuid4().hex}.tmp")
+            final = str(PurePosixPath(active_root) / f"{payload_name}.json")
             await afc.set_file_contents(temp, pointer)
             try:
                 await afc.rm(final)
