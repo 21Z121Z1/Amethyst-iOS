@@ -8,6 +8,7 @@ on:
       - 'tools/amethystctl.py'
       - 'tests/agent/**'
       - 'agent-protocol/**'
+      - 'lab/**'
       - 'AGENTS.md'
       - 'WORKFLOW.md'
       - '.github/workflows/agent-harness.yml'
@@ -17,6 +18,7 @@ on:
       - 'tools/amethystctl.py'
       - 'tests/agent/**'
       - 'agent-protocol/**'
+      - 'lab/**'
       - 'AGENTS.md'
       - 'WORKFLOW.md'
       - '.github/workflows/agent-harness.yml'
@@ -33,4 +35,11 @@ jobs:
       - name: Run host harness tests
         run: python3 -m unittest discover -s tests/agent -v
       - name: Verify CLI parses without device dependencies
-        run: python3 tools/amethystctl.py --help >/dev/null
+        run: |
+          python3 tools/amethystctl.py --help >/dev/null
+          python3 tools/amethystctl.py runtime verify --help >/dev/null
+      - name: Compile test-only Java lab event writer
+        run: |
+          rm -rf /tmp/amethyst-lab-classes
+          mkdir -p /tmp/amethyst-lab-classes
+          javac -d /tmp/amethyst-lab-classes lab/minecraft-probe/src/main/java/org/angelauramc/amethyst/lab/LabEvents.java
