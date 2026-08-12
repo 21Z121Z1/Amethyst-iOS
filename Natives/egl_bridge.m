@@ -52,7 +52,6 @@ int pojavInitOpenGL() {
     NSString *renderer = NSProcessInfo.processInfo.environment[@"POJAV_RENDERER"];
     BOOL isAuto = [renderer isEqualToString:@"auto"];
     if (isAuto || [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
-        // At this point, if renderer is still auto (unspecified major version), pick gl4es
         renderer = @ RENDERER_NAME_GL4ES;
         setenv("POJAV_RENDERER", renderer.UTF8String, 1);
         set_gl_bridge_tbl();
@@ -62,16 +61,31 @@ int pojavInitOpenGL() {
         set_gl_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE]) {
         set_gl_bridge_tbl();
+    } else if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
+        // Mithril supplies EGL and OpenGL 3.3 Core on top of native Metal.
+        // The standard GL bridge remains valid, but gl_bridge.m resolves the
+        // EGL table from libmithril.dylib rather than ANGLE.
+        set_gl_bridge_tbl();
     } else if ([renderer hasPrefix:@"libOSMesa"]) {
         setenv("GALLIUM_DRIVER","zink",1);
         set_osm_bridge_tbl();
     }
+
+    if (!br_init) {
+        NSLog(@"EGLBridge: no bridge initializer for renderer=%@", renderer ?: @"<unset>");
+        return 1;
+    }
+
     JNI_LWJGL_changeRenderer(renderer.UTF8String);
-    // Preload renderer library
-    dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, RTLD_GLOBAL);
+    // Preload renderer library. gl_bridge.m performs an independent RTLD_NOW
+    // load and required-symbol check before calling through the EGL table.
+    void *rendererHandle = dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, RTLD_NOW | RTLD_GLOBAL);
+    if (!rendererHandle) {
+        NSLog(@"EGLBridge: failed to preload renderer %@: %s", renderer, dlerror() ?: "unknown error");
+        return 1;
+    }
 
     return !br_init();
-    //return 0;
 }
 
 void pojavSetWindowHint(int hint, int value) {
@@ -84,7 +98,6 @@ void pojavSetWindowHint(int hint, int value) {
                 setenv("POJAV_RENDERER", RENDERER_NAME_GL4ES, 1);
                 JNI_LWJGL_changeRenderer(RENDERER_NAME_GL4ES);
                 break;
-            // case 4: use Zink?
             default:
                 setenv("POJAV_RENDERER", RENDERER_NAME_MOBILEGLUES, 1);
                 JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
@@ -103,16 +116,23 @@ void pojavMakeCurrent(basic_render_window_t* window) {
 
 void* pojavCreateContext(basic_render_window_t* contextSrc) {
     if (clientAPI == GLFW_NO_API) {
-        // Game has selected Vulkan API to render
         return (__bridge void *)SurfaceViewController.surface.layer;
     }
 
     static BOOL inited = NO;
     if (!inited) {
         inited = YES;
-        pojavInitOpenGL();
+        if (pojavInitOpenGL() != 0) {
+            NSLog(@"EGLBridge: renderer initialization failed");
+            return NULL;
+        }
     }
 
+    if (!br_init_context) {
+        NSLog(@"EGLBridge: renderer bridge context callback is unavailable (renderer=%@)",
+              NSProcessInfo.processInfo.environment[@"POJAV_RENDERER"] ?: @"<unset>");
+        return NULL;
+    }
     return br_init_context(contextSrc);
 }
 
