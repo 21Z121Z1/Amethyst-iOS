@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from tools.amethystd.container_io import AgentContainerClient, documents_path, safe_component
+from tools.amethystd.device import DeviceController
 from tools.amethystd.jit import JITSession
 from tools.amethystd.model import FailureClass, RunState, Stage
 from tools.amethystd.runtime_contract import verify_contract
 from tools.amethystd.store import StateStore
 from tools.amethystd.supervisor import Supervisor
+from tools.amethystd.universal_jit26_processor import Remote, reg_hex
 
 
 class RunStateTests(unittest.TestCase):
@@ -70,14 +74,6 @@ class ContractTests(unittest.TestCase):
         rows = AgentContainerClient._jsonl(b'{"event":"one"}\n\n{"event":"two"}\n')
         self.assertEqual([row["event"] for row in rows], ["one", "two"])
 
-    def test_jit_markers_require_all_positive_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "jit.log"
-            path.write_text("Got JIT mapping\n", encoding="utf-8")
-            self.assertFalse(JITSession._contains_all(path, ("Got JIT mapping", "mapping at RW=")))
-            path.write_text("Got JIT mapping\nmapping at RW=0x1 RX=0x2\n", encoding="utf-8")
-            self.assertTrue(JITSession._contains_all(path, ("Got JIT mapping", "mapping at RW=")))
-
     def test_listener_probe_does_not_connect(self) -> None:
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -85,6 +81,31 @@ class ContractTests(unittest.TestCase):
             listener.listen(1)
             self.assertTrue(JITSession._port_is_claimed(port))
         self.assertFalse(JITSession._port_is_claimed(port))
+
+    def test_bundled_processor_is_default_and_parameterized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AMETHYST_JIT_PROCESSOR", None)
+            session = JITSession(DeviceController("fake-udid"), Path(tmp))
+            command = session._processor_command(12345, 42, "run-1", "gen-1")
+            self.assertTrue(any(part.endswith("universal_jit26_processor.py") for part in command))
+            self.assertIn("12345", command)
+            self.assertIn("42", command)
+
+    def test_rsp_frame_has_valid_checksum(self) -> None:
+        frame = Remote.frame("QStartNoAckMode")
+        self.assertTrue(frame.startswith(b"$QStartNoAckMode#"))
+        payload, checksum = frame[1:].split(b"#", 1)
+        self.assertEqual(int(checksum, 16), sum(payload) & 0xFF)
+
+    def test_universal_sentinel_register_encoding_matches_rollout(self) -> None:
+        self.assertEqual(reg_hex(0x690000E0), "e000006900000000")
+
+    def test_new_log_slice_uses_only_post_launch_bytes_and_handles_rotation(self) -> None:
+        before = b"old\n"
+        after = before + b"[JIT26] Got JIT mapping\n"
+        self.assertEqual(Supervisor._new_log_slice(after, len(before)), "[JIT26] Got JIT mapping\n")
+        rotated = b"[JIT26] mapping at RW=0x1 RX=0x2\n"
+        self.assertEqual(Supervisor._new_log_slice(rotated, len(after) + 100), rotated.decode())
 
     def test_event_identity_survives_sequence_reset(self) -> None:
         first = {"process_generation": "gen-a", "seq": 1}
