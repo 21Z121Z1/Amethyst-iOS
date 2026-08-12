@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import plistlib
+import zipfile
+from pathlib import Path
 from time import monotonic
 from typing import Any
 from uuid import uuid4
@@ -128,6 +131,103 @@ class Supervisor:
             return ("generation_seq", generation, seq)
         return None
 
+    @staticmethod
+    def _local_app_metadata(path: Path) -> dict[str, str]:
+        if path.is_dir() and path.suffix == ".app":
+            info_path = path / "Info.plist"
+            with info_path.open("rb") as handle:
+                info = plistlib.load(handle)
+        elif path.is_file() and path.suffix.lower() == ".ipa":
+            with zipfile.ZipFile(path) as archive:
+                candidates = [
+                    name
+                    for name in archive.namelist()
+                    if name.startswith("Payload/") and name.count("/") == 2 and name.endswith(".app/Info.plist")
+                ]
+                if len(candidates) != 1:
+                    raise ValueError(f"expected exactly one Payload/*.app/Info.plist, found {len(candidates)}")
+                info = plistlib.loads(archive.read(candidates[0]))
+        else:
+            raise ValueError("deploy expects a .app directory or .ipa file")
+        return {
+            key: str(info[key])
+            for key in ("CFBundleIdentifier", "CFBundleVersion", "CFBundleShortVersionString")
+            if key in info
+        }
+
+    @staticmethod
+    def _parse_app_query(stdout: str, bundle_id: str) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        value = payload.get(bundle_id) if isinstance(payload, dict) else None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _version_matches(local: dict[str, str], observed: dict[str, Any] | None) -> bool:
+        if not observed:
+            return False
+        for key in ("CFBundleVersion", "CFBundleShortVersionString"):
+            expected = local.get(key)
+            if expected is not None and str(observed.get(key)) != expected:
+                return False
+        return True
+
+    async def deploy(self, app_path: str) -> dict[str, Any]:
+        path = Path(app_path).expanduser().resolve()
+        local = self._local_app_metadata(path)
+        if local.get("CFBundleIdentifier") != self.bundle_id:
+            return {
+                "ok": False,
+                "failure": FailureClass.SIGNING_FAILURE.value,
+                "detail": f"bundle mismatch: harness targets {self.bundle_id}, payload is {local.get('CFBundleIdentifier')}",
+                "local": local,
+            }
+        if not self.device_udid:
+            return {"ok": False, "failure": FailureClass.DEVICE_NOT_FOUND.value, "detail": "device UDID is required"}
+
+        before_result = await asyncio.to_thread(self.device.query_app, self.bundle_id)
+        before = self._parse_app_query(before_result.stdout, self.bundle_id) if before_result.ok else None
+        before_matches = self._version_matches(local, before)
+        install = await asyncio.to_thread(self.device.install_app, path)
+        after_result = await asyncio.to_thread(self.device.query_app, self.bundle_id)
+        after = self._parse_app_query(after_result.stdout, self.bundle_id) if after_result.ok else None
+        after_matches = self._version_matches(local, after)
+        evidence = {
+            "local": local,
+            "before": before,
+            "after": after,
+            "install": {
+                "returncode": install.returncode,
+                "timed_out": install.timed_out,
+                "stdout": install.stdout,
+                "stderr": install.stderr,
+            },
+        }
+
+        if install.ok and after_matches:
+            return {"ok": True, "observed": True, "evidence": evidence}
+        if install.timed_out:
+            if not before_matches and after_matches:
+                return {"ok": True, "observed": True, "reconciled_after_timeout": True, "evidence": evidence}
+            return {
+                "ok": False,
+                "failure": FailureClass.INSTALL_UNKNOWN.value,
+                "detail": "install timed out and post-install metadata cannot prove a state change",
+                "evidence": evidence,
+            }
+
+        signature_text = f"{install.stdout}\n{install.stderr}".lower()
+        signature_markers = ("0xe8008014", "code signature", "provision", "applicationverificationfailed", "integrity")
+        failure = FailureClass.SIGNING_FAILURE if any(marker in signature_text for marker in signature_markers) else FailureClass.INSTALL_UNKNOWN
+        return {
+            "ok": False,
+            "failure": failure.value,
+            "detail": "install command did not produce a verified installed payload",
+            "evidence": evidence,
+        }
+
     async def run_smoke(
         self,
         *,
@@ -230,6 +330,8 @@ class Supervisor:
             state.transition(Stage.PROFILE_READY)
             self.store.save(state)
 
+            await client.prepare_lab_run(state.run_id)
+            self.store.append_event(state.run_id, "lab_run_prepared")
             launch_response = await self._agent_request(client, state, "launch", {}, timeout=30)
             if not launch_response.get("ok"):
                 state.fail(FailureClass.RUNTIME_ABI_PRECHECK_FAILED, json.dumps(launch_response, sort_keys=True))
@@ -247,8 +349,12 @@ class Supervisor:
             deadline = monotonic() + timeout
             seen_events: set[tuple] = set()
             while monotonic() < deadline:
-                events = await client.read_events(state.run_id)
-                for event in events:
+                app_events = await client.read_events(state.run_id)
+                lab_events = await client.read_lab_events(state.run_id)
+                events = [("app", event) for event in app_events] + [("lab", event) for event in lab_events]
+                for source, event in events:
+                    if source == "lab" and event.get("protocol") != "amethyst-lab/v1":
+                        continue
                     key = self.event_key(event)
                     if key is not None and key in seen_events:
                         continue
@@ -257,7 +363,7 @@ class Supervisor:
 
                     event_generation = event.get("process_generation")
                     event_pid = event.get("process_id")
-                    if isinstance(event_generation, str) and isinstance(event_pid, int):
+                    if source == "app" and isinstance(event_generation, str) and isinstance(event_pid, int):
                         if state.observe_process(event_pid, event_generation):
                             self.store.append_event(
                                 state.run_id,
@@ -276,7 +382,7 @@ class Supervisor:
                     event_name = event.get("event") or event.get("stage")
                     mapped = EVENT_TO_STAGE.get(event_name)
                     if mapped:
-                        state.transition(mapped, last_app_event=event)
+                        state.transition(mapped, last_event_source=source, last_app_event=event)
                         self.store.save(state)
                         if mapped == wanted:
                             state.transition(Stage.PASS, target=wanted.value)
@@ -307,6 +413,58 @@ class Supervisor:
         client = AgentContainerClient(self.device_udid, self.bundle_id)
         manifest = await client.stage_payload(local_path, name)
         return {"ok": True, "manifest": manifest}
+
+    async def collect(self, run_id: str, *, include_crashes: bool = False, screenshot: bool = True) -> dict[str, Any]:
+        artifact_dir = self.store.artifact_dir(run_id)
+        result: dict[str, Any] = {"ok": True, "run_id": run_id, "artifact_dir": str(artifact_dir), "items": {}}
+        state = self.store.load()
+        if state and state.run_id == run_id:
+            (artifact_dir / "manifest.json").write_text(
+                json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            result["items"]["manifest"] = "manifest.json"
+
+        if not self.device_udid or not self.device.pmd3_python_api_available():
+            result["ok"] = False
+            result["detail"] = "device/container transport unavailable; host artifacts remain available"
+            return result
+
+        client = AgentContainerClient(self.device_udid, self.bundle_id)
+        for remote, local_name in (
+            (f"agent-events/{run_id}.jsonl", "agent-events.jsonl"),
+            (f"agent-lab/{run_id}.jsonl", "lab-events.jsonl"),
+            ("latestlog.txt", "amethyst-latestlog.txt"),
+        ):
+            try:
+                data = await client.read_optional(remote)
+                if data is not None:
+                    (artifact_dir / local_name).write_bytes(data)
+                    result["items"][local_name] = {"bytes": len(data)}
+            except Exception as exc:
+                result["items"][local_name] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        if screenshot:
+            try:
+                shot = await asyncio.to_thread(self.device.screenshot, artifact_dir / "screen.png")
+                result["items"]["screen.png"] = {
+                    "ok": shot.ok,
+                    "returncode": shot.returncode,
+                    "stderr": shot.stderr,
+                }
+            except Exception as exc:
+                result["items"]["screen.png"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        if include_crashes:
+            try:
+                crash = await asyncio.to_thread(self.device.pull_crashes, artifact_dir / "crash")
+                result["items"]["crash"] = {
+                    "ok": crash.ok,
+                    "returncode": crash.returncode,
+                    "stderr": crash.stderr,
+                }
+            except Exception as exc:
+                result["items"]["crash"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return result
 
     def _finish(self, state: RunState) -> dict[str, Any]:
         self.store.save(state)
