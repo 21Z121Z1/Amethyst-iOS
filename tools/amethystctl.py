@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tools.amethystd.runtime_contract import verify_contract
 from tools.amethystd.server import request_daemon
 from tools.amethystd.store import StateStore
 
@@ -99,6 +100,11 @@ def parser() -> argparse.ArgumentParser:
     stage.add_argument("path")
     stage.add_argument("--name", required=True)
 
+    runtime = sub.add_parser("runtime")
+    runtime_sub = runtime.add_subparsers(dest="runtime_action", required=True)
+    verify = runtime_sub.add_parser("verify")
+    verify.add_argument("manifest")
+
     collect = sub.add_parser("collect")
     collect.add_argument("run_id")
     collect.add_argument("--crashes", action="store_true")
@@ -110,6 +116,9 @@ def main() -> int:
     args = parser().parse_args()
     store = StateStore()
     try:
+        if args.command == "runtime" and args.runtime_action == "verify":
+            return emit(verify_contract(args.manifest))
+
         if args.command == "daemon":
             if args.action == "start":
                 ensure_daemon(store, start=True)
