@@ -22,6 +22,10 @@ class StateStore:
         return self.root / "state.json"
 
     @property
+    def config_path(self) -> Path:
+        return self.root / "config.json"
+
+    @property
     def socket_path(self) -> Path:
         return self.root / "amethystd.sock"
 
@@ -37,6 +41,22 @@ class StateStore:
         if not self.state_path.exists():
             return None
         return RunState.from_dict(json.loads(self.state_path.read_text(encoding="utf-8")))
+
+    def load_config(self) -> dict[str, Any]:
+        if not self.config_path.exists():
+            return {}
+        value = json.loads(self.config_path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("agent config must be a JSON object")
+        return value
+
+    def save_config(self, value: dict[str, Any]) -> None:
+        allowed = {"device_udid", "bundle_id"}
+        unexpected = set(value) - allowed
+        if unexpected:
+            raise ValueError(f"unsupported agent config keys: {sorted(unexpected)}")
+        clean = {key: str(item) for key, item in value.items() if item is not None and str(item)}
+        self._atomic_json(self.config_path, clean)
 
     def append_event(self, run_id: str, event: str, **payload: Any) -> None:
         record = {"timestamp": time(), "event": event, **payload}
