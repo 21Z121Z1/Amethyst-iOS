@@ -12,13 +12,7 @@ from uuid import uuid4
 
 from .container_io import AgentContainerClient
 from .device import DeviceController
-from .jit import (
-    DyldVerificationError,
-    JITProcessorUnconfigured,
-    JITSession,
-    JITVerificationError,
-    StaleDebugserverError,
-)
+from .jit import JITAttachError, JITSession, JITVerificationError, StaleDebugserverError
 from .model import FailureClass, RunState, Stage
 from .store import StateStore
 
@@ -35,6 +29,15 @@ EVENT_TO_STAGE = {
     "benchmark_warmup_started": Stage.WARMUP,
     "benchmark_started": Stage.MEASURING,
 }
+
+APP_EXEC_MARKERS = (
+    "[JIT26] Got JIT mapping",
+    "[JIT26] mapping at RW=",
+)
+APP_DYLD_MARKERS = (
+    "[DyldLVBypass] hook dyld_mmap succeed!",
+    "[DyldLVBypass] hook dyld_fcntl succeed!",
+)
 
 
 class Supervisor:
@@ -54,6 +57,7 @@ class Supervisor:
     def doctor(self) -> dict[str, Any]:
         device = self.device.doctor()
         pmd3 = device["pymobiledevice3"]
+        bundled_processor = Path(__file__).with_name("universal_jit26_processor.py")
         return {
             "ok": bool(
                 pmd3["available"]
@@ -63,7 +67,11 @@ class Supervisor:
             ),
             "bundle_id": self.bundle_id,
             "device": device,
-            "jit_processor_configured": bool(os.environ.get("AMETHYST_JIT_PROCESSOR")),
+            "jit_processor": {
+                "available": bundled_processor.is_file() or bool(os.environ.get("AMETHYST_JIT_PROCESSOR")),
+                "source": "override" if os.environ.get("AMETHYST_JIT_PROCESSOR") else "bundled",
+                "path": str(bundled_processor),
+            },
             "agent_home": str(self.store.root),
         }
 
@@ -134,8 +142,7 @@ class Supervisor:
     @staticmethod
     def _local_app_metadata(path: Path) -> dict[str, str]:
         if path.is_dir() and path.suffix == ".app":
-            info_path = path / "Info.plist"
-            with info_path.open("rb") as handle:
+            with (path / "Info.plist").open("rb") as handle:
                 info = plistlib.load(handle)
         elif path.is_file() and path.suffix.lower() == ".ipa":
             with zipfile.ZipFile(path) as archive:
@@ -228,6 +235,51 @@ class Supervisor:
             "evidence": evidence,
         }
 
+    @staticmethod
+    def _new_log_slice(raw: bytes | None, baseline: int) -> str:
+        if raw is None:
+            return ""
+        start = baseline if len(raw) >= baseline else 0
+        return raw[start:].decode("utf-8", errors="replace")
+
+    async def _wait_app_jit_proof(
+        self,
+        client: AgentContainerClient,
+        *,
+        baseline: int,
+        require_dynamic_library_load: bool,
+        timeout: float,
+    ) -> dict[str, Any]:
+        deadline = monotonic() + timeout
+        last_text = ""
+        while monotonic() < deadline:
+            raw = await client.read_optional("latestlog.txt")
+            last_text = self._new_log_slice(raw, baseline)
+            exec_ready = all(marker in last_text for marker in APP_EXEC_MARKERS)
+            dyld_ready = all(marker in last_text for marker in APP_DYLD_MARKERS)
+            if exec_ready and (dyld_ready or not require_dynamic_library_load):
+                proof_lines = [
+                    line
+                    for line in last_text.splitlines()
+                    if any(marker in line for marker in (*APP_EXEC_MARKERS, *APP_DYLD_MARKERS))
+                ]
+                return {
+                    "exec_ready": exec_ready,
+                    "dynamic_library_load_ready": dyld_ready,
+                    "markers": list(APP_EXEC_MARKERS)
+                    + (list(APP_DYLD_MARKERS) if require_dynamic_library_load else []),
+                    "proof_lines": proof_lines[-8:],
+                }
+            await asyncio.sleep(0.1)
+        exec_ready = all(marker in last_text for marker in APP_EXEC_MARKERS)
+        if not exec_ready:
+            raise JITVerificationError(
+                "host handled UniversalJIT26 but Amethyst mapping proof was not observed in new latestlog bytes"
+            )
+        raise JITVerificationError(
+            "Amethyst executable mapping succeeded but required DyldLVBypass hook proof was not observed"
+        )
+
     async def run_smoke(
         self,
         *,
@@ -260,17 +312,17 @@ class Supervisor:
             state.transition(Stage.DEVICE_PREFLIGHT_OK, doctor=doctor)
             self.store.save(state)
 
-            launch = await asyncio.to_thread(self.device.launch_app, self.bundle_id)
+            launch_app = await asyncio.to_thread(self.device.launch_app, self.bundle_id)
             self.store.append_event(
                 state.run_id,
                 "app_launch_command",
-                returncode=launch.returncode,
-                stdout=launch.stdout,
-                stderr=launch.stderr,
-                timed_out=launch.timed_out,
+                returncode=launch_app.returncode,
+                stdout=launch_app.stdout,
+                stderr=launch_app.stderr,
+                timed_out=launch_app.timed_out,
             )
-            if not launch.ok:
-                state.fail(FailureClass.AGENT_UNREACHABLE, f"devicectl launch failed: {launch.stderr.strip()}")
+            if not launch_app.ok:
+                state.fail(FailureClass.AGENT_UNREACHABLE, f"devicectl launch failed: {launch_app.stderr.strip()}")
                 return self._finish(state)
             state.transition(Stage.APP_LAUNCHED)
             self.store.save(state)
@@ -286,40 +338,7 @@ class Supervisor:
             state.transition(Stage.AGENT_READY, process_invalidated=invalidated)
             self.store.save(state)
 
-            self.jit = JITSession(self.device, self.store.artifact_dir(state.run_id))
-            state.transition(Stage.JIT_ATTACHING)
-            self.store.save(state)
-            try:
-                jit_evidence = await asyncio.to_thread(
-                    self.jit.ensure,
-                    pid=state.pid,
-                    process_generation=state.process_generation,
-                    run_id=state.run_id,
-                    require_dynamic_library_load=require_dynamic_library_load,
-                    timeout=min(timeout, 60),
-                )
-            except JITProcessorUnconfigured as exc:
-                state.fail(FailureClass.JIT_PROCESSOR_UNCONFIGURED, str(exc), blocked=True)
-                return self._finish(state)
-            except StaleDebugserverError as exc:
-                state.fail(FailureClass.STALE_DEBUGSERVER, str(exc))
-                return self._finish(state)
-            except DyldVerificationError as exc:
-                state.fail(FailureClass.DYLD_VALIDATION_FAILURE, str(exc))
-                return self._finish(state)
-            except JITVerificationError as exc:
-                state.fail(FailureClass.JIT_VERIFICATION_FAILURE, str(exc))
-                return self._finish(state)
-            state.mark_jit(
-                exec_ready=jit_evidence.exec_ready,
-                dynamic_library_load_ready=jit_evidence.dynamic_library_load_ready,
-                evidence={"jit_session": jit_evidence.to_dict()},
-            )
-            self.store.save(state)
-
-            profile_response = await self._agent_request(
-                client, state, "profile/set", {"profile": profile}, timeout=30
-            )
+            profile_response = await self._agent_request(client, state, "profile/set", {"profile": profile}, timeout=30)
             if not profile_response.get("ok"):
                 state.fail(FailureClass.RUNTIME_ABI_PRECHECK_FAILED, json.dumps(profile_response, sort_keys=True))
                 return self._finish(state)
@@ -332,6 +351,29 @@ class Supervisor:
 
             await client.prepare_lab_run(state.run_id)
             self.store.append_event(state.run_id, "lab_run_prepared")
+            latest_before = await client.read_optional("latestlog.txt")
+            latest_baseline = len(latest_before or b"")
+
+            self.jit = JITSession(self.device, self.store.artifact_dir(state.run_id))
+            state.transition(Stage.JIT_ATTACHING)
+            self.store.save(state)
+            try:
+                attach = await asyncio.to_thread(
+                    self.jit.start,
+                    pid=state.pid,
+                    process_generation=state.process_generation,
+                    run_id=state.run_id,
+                    timeout=min(timeout, 30),
+                )
+            except StaleDebugserverError as exc:
+                state.fail(FailureClass.STALE_DEBUGSERVER, str(exc))
+                return self._finish(state)
+            except (JITAttachError, TimeoutError) as exc:
+                state.fail(FailureClass.JIT_ATTACH_FAILURE, str(exc))
+                return self._finish(state)
+            state.transition(Stage.JIT_HANDSHAKE_OK, jit_attach=attach.to_dict())
+            self.store.save(state)
+
             launch_response = await self._agent_request(client, state, "launch", {}, timeout=30)
             if not launch_response.get("ok"):
                 state.fail(FailureClass.RUNTIME_ABI_PRECHECK_FAILED, json.dumps(launch_response, sort_keys=True))
@@ -346,6 +388,45 @@ class Supervisor:
             if wanted == Stage.LAUNCH_ACCEPTED:
                 state.transition(Stage.PASS, target=wanted.value)
                 return self._finish(state)
+
+            try:
+                host_jit = await asyncio.to_thread(
+                    self.jit.wait_for_host_exec,
+                    require_keep_attached=require_dynamic_library_load,
+                    timeout=min(timeout, 90),
+                )
+                app_jit = await self._wait_app_jit_proof(
+                    client,
+                    baseline=latest_baseline,
+                    require_dynamic_library_load=require_dynamic_library_load,
+                    timeout=min(timeout, 30),
+                )
+            except StaleDebugserverError as exc:
+                state.fail(FailureClass.STALE_DEBUGSERVER, str(exc))
+                return self._finish(state)
+            except JITVerificationError as exc:
+                failure = (
+                    FailureClass.DYLD_VALIDATION_FAILURE
+                    if "DyldLVBypass" in str(exc)
+                    else FailureClass.JIT_VERIFICATION_FAILURE
+                )
+                state.fail(failure, str(exc))
+                return self._finish(state)
+
+            identity_probe = await self._agent_request(client, state, "status", guard_generation=False, timeout=10)
+            if not identity_probe.get("ok") or self._observe_identity(state, identity_probe):
+                state.fail(
+                    FailureClass.JIT_VERIFICATION_FAILURE,
+                    "Amethyst process identity changed while establishing JIT proof",
+                )
+                return self._finish(state)
+            state.mark_jit(
+                exec_ready=True,
+                dynamic_library_load_ready=bool(app_jit["dynamic_library_load_ready"]),
+                evidence={"jit_host": host_jit.to_dict(), "jit_app": app_jit},
+            )
+            self.store.save(state)
+
             deadline = monotonic() + timeout
             seen_events: set[tuple] = set()
             while monotonic() < deadline:
