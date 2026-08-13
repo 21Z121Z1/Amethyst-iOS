@@ -92,18 +92,23 @@ PROCESS_SCOPED_STAGES = {
 
 _VOLATILE_HEX = re.compile(r"0x[0-9A-Fa-f]+")
 _VOLATILE_UUID = re.compile(r"\b[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\b")
-_VOLATILE_NUMBER = re.compile(r"\b\d{2,}\b")
+_VOLATILE_LABELLED_NUMBER = re.compile(
+    r"(?i)\b(pid|process(?:_id)?|port|fd)\s*([=:]?\s*)\d+\b"
+)
+_VOLATILE_LONG_NUMBER = re.compile(r"\b\d{10,}\b")
 
 
 def failure_fingerprint(failure: FailureClass, detail: str) -> str:
-    """Fingerprint the failure class plus normalized detail.
+    """Fingerprint a failure while preserving semantic error codes.
 
-    Addresses, UUIDs, PIDs, ports, and timestamps are intentionally normalized
-    so Codex can recognize an identical failing layer across fresh device runs.
+    UUIDs, addresses, explicitly labelled PID/port/FD values, and timestamp-like
+    long integers are normalized. Unlabelled short numbers remain intact so
+    errors such as E96 and E97 do not collapse to the same fingerprint.
     """
     normalized = _VOLATILE_UUID.sub("<uuid>", detail)
     normalized = _VOLATILE_HEX.sub("<hex>", normalized)
-    normalized = _VOLATILE_NUMBER.sub("<n>", normalized)
+    normalized = _VOLATILE_LABELLED_NUMBER.sub(lambda match: f"{match.group(1)}{match.group(2)}<n>", normalized)
+    normalized = _VOLATILE_LONG_NUMBER.sub("<n>", normalized)
     material = f"{failure.value}\n{normalized.strip()[:4096]}".encode("utf-8", errors="replace")
     return hashlib.sha256(material).hexdigest()[:20]
 
