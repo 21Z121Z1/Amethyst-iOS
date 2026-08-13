@@ -14,13 +14,57 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tools.amethystd.agent_output import bounded_result
 from tools.amethystd.debug_package import build_agent_debug_ipa
+from tools.amethystd.preflight import collect_host_preflight
 from tools.amethystd.runtime_contract import verify_contract
 from tools.amethystd.server import request_daemon
 from tools.amethystd.store import StateStore
 
 
+_SPECIAL_GLFW_KEYS = {
+    "SPACE": 32,
+    "ESC": 256,
+    "ESCAPE": 256,
+    "ENTER": 257,
+    "TAB": 258,
+    "BACKSPACE": 259,
+    "INSERT": 260,
+    "DELETE": 261,
+    "RIGHT": 262,
+    "LEFT": 263,
+    "DOWN": 264,
+    "UP": 265,
+    "PAGE_UP": 266,
+    "PAGE_DOWN": 267,
+    "HOME": 268,
+    "END": 269,
+    "CAPS_LOCK": 280,
+}
+
+
+def glfw_key(value: str) -> int:
+    normalized = value.strip().upper().replace("-", "_")
+    if normalized in _SPECIAL_GLFW_KEYS:
+        return _SPECIAL_GLFW_KEYS[normalized]
+    if len(normalized) == 1 and (normalized.isalpha() or normalized.isdigit()):
+        return ord(normalized)
+    if normalized.startswith("F") and normalized[1:].isdigit():
+        number = int(normalized[1:])
+        if 1 <= number <= 25:
+            return 289 + number
+    try:
+        numeric = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"unknown GLFW key {value!r}") from exc
+    if not 0 <= numeric <= 512:
+        raise argparse.ArgumentTypeError("GLFW key must be in the range 0..512")
+    return numeric
+
+
 def emit(value: dict) -> int:
+    store = StateStore()
+    value = bounded_result(value, store.root)
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
     if value.get("ok"):
         return 0
@@ -89,8 +133,14 @@ def configure_local(store: StateStore, *, device_udid: str | None, bundle_id: st
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="amethystctl")
+    root.add_argument(
+        "--max-output-bytes",
+        type=int,
+        help="Codex-facing stdout budget; oversized full JSON is stored under .amethyst-agent/tool-output",
+    )
     sub = root.add_subparsers(dest="command", required=True)
-    sub.add_parser("doctor")
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--host-only", action="store_true", help="check build/tool prerequisites without a device or daemon")
     sub.add_parser("status")
 
     configure = sub.add_parser("configure")
@@ -141,6 +191,24 @@ def parser() -> argparse.ArgumentParser:
     verify = runtime_sub.add_parser("verify")
     verify.add_argument("manifest")
 
+    logs = sub.add_parser("logs")
+    logs_sub = logs.add_subparsers(dest="logs_action", required=True)
+    query = logs_sub.add_parser("query", help="query only a bounded tail window instead of printing whole device logs")
+    query.add_argument("--source", choices=["latest", "app", "lab"], default="latest")
+    query.add_argument("--run-id")
+    query.add_argument("--contains")
+    query.add_argument("--limit", type=int, default=80)
+    query.add_argument("--max-bytes", type=int, default=65536)
+
+    input_parser = sub.add_parser("input")
+    input_sub = input_parser.add_subparsers(dest="input_action", required=True)
+    key = input_sub.add_parser("key", help="send a semantic GLFW key action")
+    key.add_argument("key", type=glfw_key, help="name such as W, ESCAPE, F3, or numeric GLFW key")
+    key.add_argument("--mode", choices=["tap", "press", "release"], default="tap")
+    key.add_argument("--hold-ms", type=int, default=50)
+    key.add_argument("--scancode", type=int, default=0)
+    key.add_argument("--mods", type=int, default=0)
+
     collect = sub.add_parser("collect")
     collect.add_argument("run_id")
     collect.add_argument("--crashes", action="store_true")
@@ -150,10 +218,15 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    if args.max_output_bytes is not None:
+        os.environ["AMETHYSTCTL_MAX_OUTPUT_BYTES"] = str(args.max_output_bytes)
     store = StateStore()
     try:
         if args.command == "runtime" and args.runtime_action == "verify":
             return emit(verify_contract(args.manifest))
+
+        if args.command == "doctor" and args.host_only:
+            return emit(collect_host_preflight(REPO_ROOT))
 
         if args.command == "configure":
             if not args.device_udid and not args.bundle_id:
@@ -208,7 +281,9 @@ def main() -> int:
 
         ensure_daemon(store, start=False)
         if args.command == "doctor":
-            return emit(asyncio.run(call("doctor")))
+            result = asyncio.run(call("doctor"))
+            result["host_preflight"] = collect_host_preflight(REPO_ROOT)
+            return emit(result)
         if args.command == "status":
             return emit(asyncio.run(call("status")))
         if args.command == "deploy":
@@ -231,6 +306,22 @@ def main() -> int:
             )
         if args.command == "payload" and args.payload_action == "stage":
             return emit(asyncio.run(call("stage_payload", {"local_path": args.path, "name": args.name})))
+        if args.command == "logs" and args.logs_action == "query":
+            return emit(asyncio.run(call("query_logs", {
+                "source": args.source,
+                "run_id": args.run_id,
+                "contains": args.contains,
+                "limit": args.limit,
+                "max_bytes": args.max_bytes,
+            })))
+        if args.command == "input" and args.input_action == "key":
+            return emit(asyncio.run(call("input_key", {
+                "key": args.key,
+                "mode": args.mode,
+                "hold_ms": args.hold_ms,
+                "scancode": args.scancode,
+                "mods": args.mods,
+            })))
         if args.command == "collect":
             return emit(
                 asyncio.run(
