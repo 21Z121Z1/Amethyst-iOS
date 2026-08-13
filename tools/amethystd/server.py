@@ -151,7 +151,7 @@ class AgentServer:
         self,
         *,
         key: int,
-        mode: str = "tap",
+        mode: str = "press",
         hold_ms: int = 50,
         scancode: int = 0,
         mods: int = 0,
@@ -161,14 +161,19 @@ class AgentServer:
             return {"ok": False, "error": "no_active_process", "detail": "launch/reconcile Amethyst before sending input"}
         if not self.supervisor.device_udid:
             return {"ok": False, "failure": "DEVICE_NOT_FOUND", "detail": "device UDID is required"}
-        params: dict[str, Any] = {"key": int(key), "scancode": int(scancode), "mods": int(mods)}
         normalized = mode.lower()
-        if normalized == "tap":
-            params.update({"mode": "tap", "hold_ms": max(1, min(int(hold_ms), 5000))})
-        elif normalized in {"press", "release"}:
-            params["action"] = 1 if normalized == "press" else 0
-        else:
-            return {"ok": False, "error": "invalid_key_mode", "detail": "mode must be tap, press, or release"}
+        if normalized not in {"press", "release"}:
+            return {
+                "ok": False,
+                "error": "invalid_key_mode",
+                "detail": "daemon input_key accepts press/release only; amethystctl expands tap into an ordered pair",
+            }
+        params: dict[str, Any] = {
+            "key": int(key),
+            "scancode": int(scancode),
+            "mods": int(mods),
+            "action": 1 if normalized == "press" else 0,
+        }
         client = AgentContainerClient(self.supervisor.device_udid, self.supervisor.bundle_id)
         return await self.supervisor._agent_request(client, state, "input/key", params, timeout=10)
 
