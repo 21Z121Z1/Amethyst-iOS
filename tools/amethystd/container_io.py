@@ -76,7 +76,7 @@ class AgentContainerClient:
         final_path = documents_path(f"agent-requests/{request_id}.json")
         temp_path = documents_path(f"agent-requests/.{request_id}.{uuid4().hex}.tmp")
         async with self._afc() as afc:
-            await afc.makedirs(documents_path("agent-requests"), exist_ok=True)
+            await afc.makedirs(documents_path("agent-requests"))
             await afc.set_file_contents(temp_path, data)
             await afc.rename(temp_path, final_path)
         return request_id
@@ -130,7 +130,7 @@ class AgentContainerClient:
         temp = documents_path(f"agent-lab/.current-run-{uuid4().hex}.tmp")
         final = documents_path("agent-lab/current-run-id")
         async with self._afc() as afc:
-            await afc.makedirs(root, exist_ok=True)
+            await afc.makedirs(root)
             await afc.set_file_contents(temp, (run_id + "\n").encode())
             try:
                 await afc.rm(final)
@@ -174,10 +174,10 @@ class AgentContainerClient:
             "files": manifest_files,
         }
         async with self._afc() as afc:
-            await afc.makedirs(stage_root, exist_ok=True)
+            await afc.makedirs(stage_root)
             for local, entry in zip(files, manifest_files, strict=True):
                 remote = str(PurePosixPath(stage_root) / entry["path"])
-                await afc.makedirs(str(PurePosixPath(remote).parent), exist_ok=True)
+                await afc.makedirs(str(PurePosixPath(remote).parent))
                 data = local.read_bytes()
                 await afc.set_file_contents(remote, data)
                 observed = await afc.get_file_contents(remote)
@@ -186,7 +186,7 @@ class AgentContainerClient:
             manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
             await afc.set_file_contents(str(PurePosixPath(stage_root) / "manifest.json"), manifest_data)
             active_root = documents_path("agent-payloads/active")
-            await afc.makedirs(active_root, exist_ok=True)
+            await afc.makedirs(active_root)
             pointer = json.dumps(
                 {"name": payload_name, "digest": deployment_digest, "stage": stage_relative},
                 sort_keys=True,

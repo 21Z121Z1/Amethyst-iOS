@@ -129,14 +129,14 @@ public final class Tools {
                 }
             }
         }
-        String[] argsFromJson = JSONUtils.insertJSONValueList(
-            splitAndFilterEmpty(
-                versionInfo.minecraftArguments == null ?
-                fromStringArray(minecraftArgs.toArray(new String[0])):
-                versionInfo.minecraftArguments,
-                profile
-            ), varArgMap
-        );
+        // Keep each modern version-metadata entry as one argv element.  The
+        // quick-play identifier is a world directory name and may contain
+        // spaces (for example, "New World"); flattening the list and then
+        // splitting on spaces silently changes that identifier to "New".
+        String[] argsFromJson = versionInfo.minecraftArguments == null
+            ? minecraftArgs.toArray(new String[0])
+            : splitAndFilterEmpty(versionInfo.minecraftArguments, profile);
+        argsFromJson = JSONUtils.insertJSONValueList(argsFromJson, varArgMap);
         // Tools.dialogOnUiThread(this, "Result args", Arrays.asList(argsFromJson).toString());
         return argsFromJson;
     }

@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "glfw_keycodes.h"
+
 static dispatch_source_t AgentInboxTimer;
 static NSString *AgentActiveRunID;
 static uint64_t AgentEventSequence;
@@ -181,6 +183,31 @@ static BOOL AgentBoolValue(id value, BOOL defaultValue) {
     return [@[@"1", @"true", @"yes", @"on"] containsObject:[value lowercaseString]];
 }
 
+static NSString *AgentRebaseContainerPath(NSString *value) {
+    if (![value isKindOfClass:NSString.class] || !value.length) return value;
+    NSString *home = AgentHomePath();
+    if (!home.length) return value;
+
+    NSString *containerRoot = [home hasSuffix:@"/Documents"]
+        ? [home substringToIndex:home.length - @"/Documents".length]
+        : home;
+
+    NSRegularExpression *expression = [NSRegularExpression
+        regularExpressionWithPattern:@"/private/var/mobile/Containers/Data/Application/[0-9A-Fa-f-]+(?:/Documents)+"
+        options:0 error:nil];
+    return [expression stringByReplacingMatchesInString:value
+        options:0 range:NSMakeRange(0, value.length)
+        withTemplate:[containerRoot stringByAppendingString:@"/Documents"]];
+}
+
+static void AgentRebaseProfilePaths(NSMutableDictionary *profile) {
+    if (![profile isKindOfClass:NSMutableDictionary.class]) return;
+    NSString *javaArgs = profile[@"javaArgs"];
+    if ([javaArgs isKindOfClass:NSString.class]) {
+        profile[@"javaArgs"] = AgentRebaseContainerPath(javaArgs);
+    }
+}
+
 static BOOL AgentSetGameDirectory(NSString *instance, NSString **errorMessage) {
     if (!instance.length || [instance isEqualToString:@"."] || [instance isEqualToString:@".."] ||
         [instance containsString:@"/"] || [instance containsString:@"\\"] || [instance containsString:@".."]) {
@@ -249,6 +276,8 @@ static NSDictionary *AgentStatus(void) {
     if (profiles.selectedProfileName) profile[@"name"] = profiles.selectedProfileName;
     if (selected[@"lastVersionId"]) profile[@"version"] = selected[@"lastVersionId"];
     if (selected[@"renderer"]) profile[@"renderer"] = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+    if ([selected[@"quickPlaySingleplayer"] isKindOfClass:NSString.class])
+        profile[@"quick_play_singleplayer"] = selected[@"quickPlaySingleplayer"];
     NSString *instance = getPrefObject(@"general.game_directory");
     if (instance) profile[@"instance"] = instance;
     return @{
@@ -287,10 +316,68 @@ static NSDictionary *AgentJITProbe(void) {
     return result;
 }
 
+static NSNumber *AgentNumber(NSDictionary *params, NSString *key) {
+    id value = params[key];
+    if ([value isKindOfClass:NSNumber.class]) return value;
+    if ([value isKindOfClass:NSString.class]) {
+        NSScanner *scanner = [NSScanner scannerWithString:value];
+        NSInteger parsed = 0;
+        if ([scanner scanInteger:&parsed] && scanner.isAtEnd) return @(parsed);
+    }
+    return nil;
+}
+
+static NSDictionary *AgentInputResult(NSString *state) {
+    NSMutableDictionary *result = [AgentStatus() mutableCopy];
+    result[@"state"] = state;
+    result[@"input"] = @YES;
+    return result;
+}
+
 static NSDictionary *AgentHandleAction(NSString *action, NSDictionary *params) {
     if ([action isEqualToString:@"status"]) return AgentStatus();
     if ([action isEqualToString:@"probe/runtime"]) return AgentRuntimeProbe();
     if ([action isEqualToString:@"probe/jit"]) return AgentJITProbe();
+
+    if ([action isEqualToString:@"input/key"]) {
+        if (!SurfaceViewController.isRunning)
+            return @{ @"ok": @NO, @"state": @"input_rejected", @"error": @"Minecraft is not running" };
+        NSNumber *keyValue = AgentNumber(params, @"key");
+        NSNumber *actionValue = AgentNumber(params, @"action");
+        NSNumber *scancodeValue = AgentNumber(params, @"scancode");
+        NSNumber *modsValue = AgentNumber(params, @"mods");
+        if (!keyValue || !actionValue || keyValue.intValue < 0 ||
+            keyValue.intValue > GLFW_KEY_LAST ||
+            (actionValue.intValue != 0 && actionValue.intValue != 1) ||
+            (modsValue && (modsValue.intValue < 0 || modsValue.intValue > 255))) {
+            return @{ @"ok": @NO, @"state": @"input_rejected", @"error": @"invalid key input" };
+        }
+        CallbackBridge_nativeSendKey(
+            keyValue.intValue,
+            scancodeValue ? scancodeValue.intValue : 0,
+            actionValue.intValue,
+            modsValue ? modsValue.intValue : 0);
+        return AgentInputResult(@"input_key_sent");
+    }
+
+    if ([action isEqualToString:@"input/mouse"]) {
+        if (!SurfaceViewController.isRunning)
+            return @{ @"ok": @NO, @"state": @"input_rejected", @"error": @"Minecraft is not running" };
+        NSNumber *buttonValue = AgentNumber(params, @"button");
+        NSNumber *actionValue = AgentNumber(params, @"action");
+        NSNumber *modsValue = AgentNumber(params, @"mods");
+        if (!buttonValue || !actionValue || buttonValue.intValue < 0 ||
+            buttonValue.intValue > 7 ||
+            (actionValue.intValue != 0 && actionValue.intValue != 1) ||
+            (modsValue && (modsValue.intValue < 0 || modsValue.intValue > 255))) {
+            return @{ @"ok": @NO, @"state": @"input_rejected", @"error": @"invalid mouse input" };
+        }
+        CallbackBridge_nativeSendMouseButton(
+            buttonValue.intValue,
+            actionValue.intValue,
+            modsValue ? modsValue.intValue : 0);
+        return AgentInputResult(@"input_mouse_sent");
+    }
 
     if ([action isEqualToString:@"terminate"]) {
         BOOL force = AgentBoolValue(params[@"force"], NO);
@@ -324,7 +411,20 @@ static NSDictionary *AgentHandleAction(NSString *action, NSDictionary *params) {
     if (!profileName.length) profileName = profiles.selectedProfileName;
     NSMutableDictionary *profile = profiles.profiles[profileName];
     if (!profile) return @{ @"ok": @NO, @"state": @"profile_not_found", @"error": @"requested profile does not exist" };
+    for (NSMutableDictionary *candidate in profiles.profiles.allValues) {
+        AgentRebaseProfilePaths(candidate);
+    }
+    NSString *globalJavaArgs = getPrefObject(@"java.java_args");
+    if ([globalJavaArgs isKindOfClass:NSString.class]) {
+        setPrefObject(@"java.java_args", AgentRebaseContainerPath(globalJavaArgs));
+    }
     if (version.length) profile[@"lastVersionId"] = version;
+    NSString *quickPlay = [params[@"quickPlaySingleplayer"] isKindOfClass:NSString.class]
+        ? params[@"quickPlaySingleplayer"] : params[@"quick_play_singleplayer"];
+    if ([quickPlay isKindOfClass:NSString.class]) {
+        if (quickPlay.length) profile[@"quickPlaySingleplayer"] = quickPlay;
+        else [profile removeObjectForKey:@"quickPlaySingleplayer"];
+    }
     profiles.selectedProfileName = profileName;
     [profiles save];
 
@@ -399,7 +499,7 @@ static void AgentPollInbox(void) {
     for (NSString *file in files) {
         if (count >= 8 || ![file hasSuffix:@".json"]) continue;
         NSString *requestID = [file stringByDeletingPathExtension];
-        if (![[AgentSafeIdentifier(requestID) ?: @""] isEqualToString:requestID]) continue;
+        if (![(AgentSafeIdentifier(requestID) ?: @"") isEqualToString:requestID]) continue;
         NSString *source = [requestDir stringByAppendingPathComponent:file];
         NSString *claimed = [processingDir stringByAppendingPathComponent:file];
         NSString *done = [processedDir stringByAppendingPathComponent:file];

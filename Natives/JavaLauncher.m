@@ -22,6 +22,74 @@
 
 extern char **environ;
 
+static NSString *JavaLauncherRebaseContainerPaths(NSString *value) {
+    if (![value isKindOfClass:NSString.class] || !value.length) return value;
+    const char *home = getenv("POJAV_HOME");
+    if (!home || !home[0]) return value;
+
+    NSString *homePath = @(home);
+    NSString *containerRoot = [homePath hasSuffix:@"/Documents"]
+        ? [homePath substringToIndex:homePath.length - @"/Documents".length]
+        : homePath;
+    NSRegularExpression *expression = [NSRegularExpression
+        regularExpressionWithPattern:@"/private/var/mobile/Containers/Data/Application/[0-9A-Fa-f-]+(?:/Documents)+"
+        options:0 error:nil];
+    return [expression stringByReplacingMatchesInString:value
+        options:0 range:NSMakeRange(0, value.length)
+        withTemplate:[containerRoot stringByAppendingString:@"/Documents"]];
+}
+
+// Pojav's bundled launcher.jar only consumes string entries from the
+// version's `arguments.game` array.  Minecraft 26.2 publishes quick-play as
+// conditional argument objects, which that launcher silently skips.  Keep
+// the opt-in in the profile and materialize it into the version JSON just
+// before launch, after the normal metadata/SHA1 download step has completed.
+static void JavaLauncherApplyQuickPlay(NSString *gameDir, NSString *versionID) {
+    NSString *world = [PLProfiles resolveKeyForCurrentProfile:@"quickPlaySingleplayer"];
+    if (![world isKindOfClass:NSString.class] || world.length == 0 ||
+        ![versionID isKindOfClass:NSString.class] || versionID.length == 0)
+        return;
+
+    NSString *path = [gameDir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"versions/%@/%@.json", versionID, versionID]];
+    NSMutableDictionary *json = parseJSONFromFile(path);
+    if (json[@"NSErrorObject"]) {
+        NSLog(@"[QuickPlay] Could not read %@", path);
+        return;
+    }
+
+    NSMutableDictionary *arguments = [json[@"arguments"] mutableCopy];
+    NSMutableArray *game = [arguments[@"game"] mutableCopy];
+    if (![arguments isKindOfClass:NSMutableDictionary.class] ||
+        ![game isKindOfClass:NSMutableArray.class]) {
+        NSLog(@"[QuickPlay] %@ has no mutable arguments.game array", versionID);
+        return;
+    }
+
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:game.count + 2];
+    for (NSUInteger i = 0; i < game.count; ++i) {
+        id value = game[i];
+        if ([value isKindOfClass:NSString.class] &&
+            [value isEqualToString:@"--quickPlaySingleplayer"]) {
+            if (i + 1 < game.count &&
+                [game[i + 1] isKindOfClass:NSString.class]) ++i;
+            continue;
+        }
+        [filtered addObject:value];
+    }
+    [filtered addObject:@"--quickPlaySingleplayer"];
+    [filtered addObject:world];
+    arguments[@"game"] = filtered;
+    json[@"arguments"] = arguments;
+
+    NSError *error = saveJSONToFile(json, path);
+    if (error) {
+        NSLog(@"[QuickPlay] Failed to write %@: %@", path, error.localizedDescription);
+    } else {
+        NSLog(@"[QuickPlay] Added --quickPlaySingleplayer %@ to %@", world, versionID);
+    }
+}
+
 BOOL validateVirtualMemorySpace(size_t size) {
     size <<= 20; // convert to MB
     void *map = mmap(0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -75,6 +143,7 @@ void init_loadCustomJvmFlags(int* argc, const char** argv) {
     if (jvmargs == nil) return;
     // Make the separator happy
     jvmargs = [jvmargs stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    jvmargs = JavaLauncherRebaseContainerPaths(jvmargs);
     jvmargs = [@" " stringByAppendingString:jvmargs];
 
     NSLog(@"[JavaLauncher] Reading custom JVM flags");
@@ -178,6 +247,7 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
             getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
             [PLProfiles resolveKeyForCurrentProfile:@"gameDir"]]
             .stringByStandardizingPath;
+        JavaLauncherApplyQuickPlay(gameDir, launchTarget[@"id"]);
     } else {
         defaultJRETag = @"execute_jar";
         gameDir = @(getenv("POJAV_GAME_DIR"));
