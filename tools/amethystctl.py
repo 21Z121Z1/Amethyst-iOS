@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from time import monotonic, sleep
+from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -16,6 +17,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.amethystd.agent_output import bounded_result
 from tools.amethystd.debug_package import build_agent_debug_ipa
+from tools.amethystd.device import DeviceController
+from tools.amethystd.frame_metrics import analyze_png, compare_png_frames
 from tools.amethystd.preflight import collect_host_preflight
 from tools.amethystd.runtime_contract import verify_contract
 from tools.amethystd.server import request_daemon
@@ -131,6 +134,46 @@ def configure_local(store: StateStore, *, device_udid: str | None, bundle_id: st
     return {"ok": True, "configuration": store.load_config(), "daemon_reconfigure_pending": True}
 
 
+def frame_probe(store: StateStore, *, samples: int, interval: float) -> dict:
+    config = store.load_config()
+    udid = os.environ.get("AMETHYST_DEVICE_UDID") or config.get("device_udid")
+    if not udid:
+        return {"ok": False, "failure": "DEVICE_NOT_FOUND", "detail": "configure a device before frame probe"}
+    samples = max(1, min(int(samples), 8))
+    interval = max(0.0, min(float(interval), 5.0))
+    controller = DeviceController(udid)
+    run_id = f"frame-probe-{uuid4().hex[:12]}"
+    directory = store.artifact_dir(run_id)
+    paths: list[Path] = []
+    metrics: list[dict] = []
+    for index in range(samples):
+        path = directory / f"frame-{index:02d}.png"
+        shot = controller.screenshot(path)
+        if not shot.ok:
+            return {
+                "ok": False,
+                "failure": "DEVICE_DISCONNECTED",
+                "detail": "device screenshot failed",
+                "returncode": shot.returncode,
+                "stderr": shot.stderr[-4096:],
+                "artifact_dir": str(directory),
+            }
+        paths.append(path)
+        metrics.append(analyze_png(path))
+        if index + 1 < samples and interval:
+            sleep(interval)
+    comparisons = [compare_png_frames(paths[i], paths[i + 1]) for i in range(len(paths) - 1)]
+    hashes = {item.get("sha256") for item in metrics if item.get("sha256")}
+    return {
+        "ok": True,
+        "artifact_dir": str(directory),
+        "samples": metrics,
+        "comparisons": comparisons,
+        "all_samples_identical": len(hashes) == 1 if hashes else None,
+        "interpretation": "identical frames are evidence of a static presentation window, not by themselves proof of a renderer hang",
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="amethystctl")
     root.add_argument(
@@ -209,6 +252,12 @@ def parser() -> argparse.ArgumentParser:
     key.add_argument("--scancode", type=int, default=0)
     key.add_argument("--mods", type=int, default=0)
 
+    frame = sub.add_parser("frame")
+    frame_sub = frame.add_subparsers(dest="frame_action", required=True)
+    probe = frame_sub.add_parser("probe", help="capture numerical framebuffer evidence for text-only agents")
+    probe.add_argument("--samples", type=int, default=2)
+    probe.add_argument("--interval", type=float, default=0.25)
+
     collect = sub.add_parser("collect")
     collect.add_argument("run_id")
     collect.add_argument("--crashes", action="store_true")
@@ -224,9 +273,10 @@ def main() -> int:
     try:
         if args.command == "runtime" and args.runtime_action == "verify":
             return emit(verify_contract(args.manifest))
-
         if args.command == "doctor" and args.host_only:
             return emit(collect_host_preflight(REPO_ROOT))
+        if args.command == "frame" and args.frame_action == "probe":
+            return emit(frame_probe(store, samples=args.samples, interval=args.interval))
 
         if args.command == "configure":
             if not args.device_udid and not args.bundle_id:
@@ -260,11 +310,7 @@ def main() -> int:
             ensure_daemon(store, start=True)
             asyncio.run(call("configure", {"device_udid": device_udid, "bundle_id": bundle_id}))
             deployment = asyncio.run(call("deploy", {"app_path": result["output"]}))
-            combined = {
-                "ok": bool(deployment.get("ok")),
-                "package": result,
-                "deploy": deployment,
-            }
+            combined = {"ok": bool(deployment.get("ok")), "package": result, "deploy": deployment}
             if not combined["ok"]:
                 combined["failure"] = deployment.get("failure", "INSTALL_UNKNOWN")
             return emit(combined)
@@ -291,19 +337,12 @@ def main() -> int:
         if args.command == "stop":
             return emit(asyncio.run(call("stop", {"force": args.force, "timeout": args.timeout})))
         if args.command == "run" and args.run_kind == "smoke":
-            return emit(
-                asyncio.run(
-                    call(
-                        "run_smoke",
-                        {
-                            "profile": args.profile,
-                            "target": args.target,
-                            "timeout": args.timeout,
-                            "require_dynamic_library_load": not args.no_dynamic_dylib,
-                        },
-                    )
-                )
-            )
+            return emit(asyncio.run(call("run_smoke", {
+                "profile": args.profile,
+                "target": args.target,
+                "timeout": args.timeout,
+                "require_dynamic_library_load": not args.no_dynamic_dylib,
+            })))
         if args.command == "payload" and args.payload_action == "stage":
             return emit(asyncio.run(call("stage_payload", {"local_path": args.path, "name": args.name})))
         if args.command == "logs" and args.logs_action == "query":
@@ -334,18 +373,11 @@ def main() -> int:
                 "response": release,
             })
         if args.command == "collect":
-            return emit(
-                asyncio.run(
-                    call(
-                        "collect",
-                        {
-                            "run_id": args.run_id,
-                            "include_crashes": args.crashes,
-                            "screenshot": not args.no_screenshot,
-                        },
-                    )
-                )
-            )
+            return emit(asyncio.run(call("collect", {
+                "run_id": args.run_id,
+                "include_crashes": args.crashes,
+                "screenshot": not args.no_screenshot,
+            })))
         return emit({"ok": False, "error": "unsupported_command"})
     except Exception as exc:
         print(f"amethystctl: {type(exc).__name__}: {exc}", file=sys.stderr)
