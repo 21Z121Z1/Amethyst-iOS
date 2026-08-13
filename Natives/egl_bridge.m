@@ -1,4 +1,6 @@
 #import "SurfaceViewController.h"
+#import "AgentControl.h"
+#import "AgentPayload.h"
 
 #include "jni.h"
 #include <assert.h>
@@ -50,6 +52,10 @@ int pojavInit(BOOL useStackQueue) {
 
 int pojavInitOpenGL() {
     NSString *renderer = NSProcessInfo.processInfo.environment[@"POJAV_RENDERER"];
+    AgentControlEmitActiveEvent(@"renderer_loading", @{
+        @"renderer": renderer ?: @"<unset>"
+    });
+
     BOOL isAuto = [renderer isEqualToString:@"auto"];
     if (isAuto || [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
         renderer = @ RENDERER_NAME_GL4ES;
@@ -62,9 +68,6 @@ int pojavInitOpenGL() {
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE]) {
         set_gl_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
-        // Mithril supplies EGL and OpenGL 3.3 Core on top of native Metal.
-        // The standard GL bridge remains valid, but gl_bridge.m resolves the
-        // EGL table from libmithril.dylib rather than ANGLE.
         set_gl_bridge_tbl();
     } else if ([renderer hasPrefix:@"libOSMesa"]) {
         setenv("GALLIUM_DRIVER","zink",1);
@@ -73,19 +76,55 @@ int pojavInitOpenGL() {
 
     if (!br_init) {
         NSLog(@"EGLBridge: no bridge initializer for renderer=%@", renderer ?: @"<unset>");
+        AgentControlEmitActiveEvent(@"failed", @{
+            @"failure_class": @"RENDERER_INIT_FAILURE",
+            @"reason": @"bridge_initializer_unavailable",
+            @"renderer": renderer ?: @"<unset>"
+        });
         return 1;
     }
 
     JNI_LWJGL_changeRenderer(renderer.UTF8String);
-    // Preload renderer library. gl_bridge.m performs an independent RTLD_NOW
-    // load and required-symbol check before calling through the EGL table.
-    void *rendererHandle = dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, RTLD_NOW | RTLD_GLOBAL);
-    if (!rendererHandle) {
-        NSLog(@"EGLBridge: failed to preload renderer %@: %s", renderer, dlerror() ?: "unknown error");
+    NSError *payloadError = nil;
+    NSString *payloadName = [renderer isEqualToString:@ RENDERER_NAME_MITHRIL] ? @"mithril" : nil;
+    NSString *rendererPath = AgentPayloadLibraryPath(renderer, payloadName, &payloadError);
+    if (!rendererPath) {
+        NSLog(@"EGLBridge: active renderer payload rejected: %@", payloadError.localizedDescription);
+        AgentControlEmitActiveEvent(@"failed", @{
+            @"failure_class": @"RENDERER_INIT_FAILURE",
+            @"reason": @"hot_payload_verification_failed",
+            @"renderer": renderer ?: @"<unset>"
+        });
         return 1;
     }
 
-    return !br_init();
+    void *rendererHandle = dlopen(rendererPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
+    if (!rendererHandle) {
+        NSLog(@"EGLBridge: failed to preload renderer %@: %s", renderer, dlerror() ?: "unknown error");
+        AgentControlEmitActiveEvent(@"failed", @{
+            @"failure_class": @"NATIVE_DYLIB_LOAD_FAILURE",
+            @"reason": @"renderer_dlopen_failed",
+            @"renderer": renderer ?: @"<unset>",
+            @"hot_payload": @([rendererPath hasPrefix:@"/"])
+        });
+        return 1;
+    }
+
+    if (!br_init()) {
+        AgentControlEmitActiveEvent(@"failed", @{
+            @"failure_class": @"RENDERER_INIT_FAILURE",
+            @"reason": @"egl_bridge_init_failed",
+            @"renderer": renderer ?: @"<unset>",
+            @"hot_payload": @([rendererPath hasPrefix:@"/"])
+        });
+        return 1;
+    }
+
+    AgentControlEmitActiveEvent(@"renderer_ready", @{
+        @"renderer": renderer ?: @"<unset>",
+        @"hot_payload": @([rendererPath hasPrefix:@"/"])
+    });
+    return 0;
 }
 
 void pojavSetWindowHint(int hint, int value) {
@@ -131,9 +170,20 @@ void* pojavCreateContext(basic_render_window_t* contextSrc) {
     if (!br_init_context) {
         NSLog(@"EGLBridge: renderer bridge context callback is unavailable (renderer=%@)",
               NSProcessInfo.processInfo.environment[@"POJAV_RENDERER"] ?: @"<unset>");
+        AgentControlEmitActiveEvent(@"failed", @{
+            @"failure_class": @"RENDERER_INIT_FAILURE",
+            @"reason": @"bridge_context_callback_unavailable"
+        });
         return NULL;
     }
-    return br_init_context(contextSrc);
+    void *context = br_init_context(contextSrc);
+    if (!context) {
+        AgentControlEmitActiveEvent(@"failed", @{
+            @"failure_class": @"RENDERER_INIT_FAILURE",
+            @"reason": @"context_creation_failed"
+        });
+    }
+    return context;
 }
 
 void pojavSwapInterval(int interval) {

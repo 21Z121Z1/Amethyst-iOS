@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import "SurfaceViewController.h"
+#import "AgentPayload.h"
 
 #include <dlfcn.h>
 #include <string.h>
@@ -14,11 +15,22 @@ static egl_library handle;
 static bool dlsym_EGL() {
     const char *renderer = getenv("POJAV_RENDERER");
     const char *eglLibrary = RENDERER_NAME_MTL_ANGLE;
+    NSString *payloadName = nil;
     if (renderer && strcmp(renderer, RENDERER_NAME_MITHRIL) == 0) {
         eglLibrary = RENDERER_NAME_MITHRIL;
+        payloadName = @"mithril";
     }
 
-    NSString *eglPath = [NSString stringWithFormat:@"@rpath/%s", eglLibrary];
+    NSError *payloadError = nil;
+    NSString *eglPath = AgentPayloadLibraryPath(@(eglLibrary), payloadName, &payloadError);
+    if (!eglPath) {
+        NSLog(@"EGLBridge: active %@ payload rejected: %@", payloadName ?: @"renderer", payloadError.localizedDescription);
+        return false;
+    }
+    if (payloadName.length && [eglPath hasPrefix:@"/"]) {
+        NSLog(@"EGLBridge: using verified hot renderer payload %@", eglPath);
+    }
+
     void* dl_handle = dlopen(eglPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
     if (!dl_handle) {
         NSLog(@"EGLBridge: failed to load %@: %s", eglPath, dlerror() ?: "unknown error");
