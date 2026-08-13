@@ -21,18 +21,9 @@ def _state_summary(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
     keys = (
-        "run_id",
-        "bundle_id",
-        "stage",
-        "failure",
-        "failure_detail",
-        "pid",
-        "process_generation",
-        "jit_exec_ready",
-        "dynamic_library_load_ready",
-        "app_state",
-        "profile",
-        "updated_at",
+        "run_id", "bundle_id", "stage", "failure", "failure_detail", "failure_fingerprint",
+        "pid", "process_generation", "jit_exec_ready", "dynamic_library_load_ready",
+        "app_state", "profile", "updated_at",
     )
     result = {key: value[key] for key in keys if key in value}
     if "failure_detail" in result:
@@ -64,9 +55,11 @@ def _artifact_summary(value: Any) -> Any:
 
 
 def summarize_for_agent(value: dict[str, Any]) -> dict[str, Any]:
-    """Return a compact, stable summary suitable for a Codex tool result."""
     result: dict[str, Any] = {"ok": bool(value.get("ok"))}
-    for key in ("error", "failure", "detail", "method", "accepted", "observed", "healthy", "socket"):
+    for key in (
+        "error", "failure", "failure_fingerprint", "detail", "method", "accepted", "observed",
+        "healthy", "socket", "phase", "mode", "key", "hold_ms",
+    ):
         if key in value:
             result[key] = _trim_text(value[key])
     if "state" in value:
@@ -75,7 +68,10 @@ def summarize_for_agent(value: dict[str, Any]) -> dict[str, Any]:
         result["artifacts"] = _artifact_summary(value["artifacts"])
     if "items" in value and "artifacts" not in value:
         result["items"] = _artifact_summary({"items": value["items"]}).get("items", {})
-    for key in ("probe", "configuration", "preflight", "metrics", "diagnostic", "lines", "cursor"):
+    for key in (
+        "probe", "configuration", "preflight", "host_preflight", "metrics", "diagnostic",
+        "lines", "cursor", "remediation",
+    ):
         if key in value:
             candidate = value[key]
             encoded = json.dumps(candidate, sort_keys=True, default=str)
@@ -83,18 +79,7 @@ def summarize_for_agent(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def bounded_result(
-    value: dict[str, Any],
-    root: Path,
-    *,
-    max_bytes: int | None = None,
-) -> dict[str, Any]:
-    """Persist oversized JSON and return a bounded summary for stdout.
-
-    Codex tool output is context. Full evidence remains available on disk, while
-    routine tool calls stay small enough to inspect repeatedly without flooding
-    the agent loop.
-    """
+def bounded_result(value: dict[str, Any], root: Path, *, max_bytes: int | None = None) -> dict[str, Any]:
     if max_bytes is None:
         try:
             max_bytes = int(os.environ.get("AMETHYSTCTL_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT_BYTES))
