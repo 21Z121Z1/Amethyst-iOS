@@ -71,6 +71,11 @@ class FailureFingerprintTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, failure_fingerprint(FailureClass.JIT_VERIFICATION_FAILURE, "pid 99999 at 0xABCDEF port 62002"))
 
+    def test_semantic_error_codes_remain_distinct(self) -> None:
+        first = failure_fingerprint(FailureClass.STALE_DEBUGSERVER, "debugserver rejected request E96 on pid 12345")
+        second = failure_fingerprint(FailureClass.STALE_DEBUGSERVER, "debugserver rejected request E97 on pid 99999")
+        self.assertNotEqual(first, second)
+
 
 class ContainerStreamingTests(unittest.TestCase):
     def test_bounded_read_never_requests_more_than_chunk_budget(self) -> None:
@@ -125,7 +130,6 @@ class SemanticInputTests(unittest.TestCase):
 class AgentDebugShapeTests(unittest.TestCase):
     @staticmethod
     def write_macho(path: Path, filetype: int) -> None:
-        # arm64-style little-endian 64-bit Mach-O header prefix.
         path.write_bytes(b"\xcf\xfa\xed\xfe" + struct.pack("<III", 0x0100000C, 0, filetype) + b"\x00" * 16)
 
     def test_mh_execute_is_accepted_and_dylib_is_rejected(self) -> None:
