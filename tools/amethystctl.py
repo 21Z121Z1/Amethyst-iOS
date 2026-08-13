@@ -315,13 +315,24 @@ def main() -> int:
                 "max_bytes": args.max_bytes,
             })))
         if args.command == "input" and args.input_action == "key":
-            return emit(asyncio.run(call("input_key", {
+            common = {"key": args.key, "hold_ms": args.hold_ms, "scancode": args.scancode, "mods": args.mods}
+            if args.mode != "tap":
+                return emit(asyncio.run(call("input_key", {**common, "mode": args.mode})))
+            press = asyncio.run(call("input_key", {**common, "mode": "press"}))
+            if not press.get("ok"):
+                return emit({"ok": False, "phase": "press", "response": press})
+            hold_ms = max(1, min(int(args.hold_ms), 5000))
+            sleep(hold_ms / 1000.0)
+            release = asyncio.run(call("input_key", {**common, "mode": "release"}))
+            return emit({
+                "ok": bool(release.get("ok")),
+                "mode": "tap",
                 "key": args.key,
-                "mode": args.mode,
-                "hold_ms": args.hold_ms,
-                "scancode": args.scancode,
-                "mods": args.mods,
-            })))
+                "hold_ms": hold_ms,
+                "press_state": press.get("state"),
+                "release_state": release.get("state"),
+                "response": release,
+            })
         if args.command == "collect":
             return emit(
                 asyncio.run(
