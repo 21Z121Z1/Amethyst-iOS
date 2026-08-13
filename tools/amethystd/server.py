@@ -94,6 +94,84 @@ class AgentServer:
             "response": response,
         }
 
+    async def _query_logs(
+        self,
+        *,
+        source: str = "latest",
+        run_id: str | None = None,
+        contains: str | None = None,
+        limit: int = 80,
+        max_bytes: int = 65536,
+    ) -> dict[str, Any]:
+        if not self.supervisor.device_udid:
+            return {"ok": False, "failure": "DEVICE_NOT_FOUND", "detail": "device UDID is required"}
+        state = self.store.load()
+        effective_run = run_id or (state.run_id if state else None)
+        if source == "latest":
+            relative = "latestlog.txt"
+        elif source in {"app", "lab"}:
+            if not effective_run:
+                return {"ok": False, "error": "run_id_required", "detail": f"{source} event query requires a run id"}
+            directory = "agent-events" if source == "app" else "agent-lab"
+            relative = f"{directory}/{effective_run}.jsonl"
+        else:
+            return {"ok": False, "error": "invalid_log_source", "detail": "source must be latest, app, or lab"}
+
+        limit = max(1, min(int(limit), 500))
+        max_bytes = max(1024, min(int(max_bytes), 65536))
+        client = AgentContainerClient(self.supervisor.device_udid, self.supervisor.bundle_id)
+        chunk = await client.read_chunk(relative, offset=-max_bytes, max_bytes=max_bytes)
+        if not chunk.get("ok"):
+            return chunk
+        if chunk.get("exists") is False:
+            return {"ok": True, "source": source, "run_id": effective_run, "lines": [], "exists": False}
+        text = (chunk.get("data") or b"").decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        if contains:
+            needle = contains.casefold()
+            lines = [line for line in lines if needle in line.casefold()]
+        lines = lines[-limit:]
+        return {
+            "ok": True,
+            "source": source,
+            "run_id": effective_run,
+            "contains": contains,
+            "lines": lines,
+            "cursor": {
+                "path": relative,
+                "file_size": chunk.get("size"),
+                "window_offset": chunk.get("offset"),
+                "next_offset": chunk.get("next_offset"),
+                "bytes_examined": len(text.encode("utf-8", errors="replace")),
+                "line_count": len(lines),
+            },
+        }
+
+    async def _input_key(
+        self,
+        *,
+        key: int,
+        mode: str = "tap",
+        hold_ms: int = 50,
+        scancode: int = 0,
+        mods: int = 0,
+    ) -> dict[str, Any]:
+        state = self.store.load()
+        if state is None or not state.process_generation:
+            return {"ok": False, "error": "no_active_process", "detail": "launch/reconcile Amethyst before sending input"}
+        if not self.supervisor.device_udid:
+            return {"ok": False, "failure": "DEVICE_NOT_FOUND", "detail": "device UDID is required"}
+        params: dict[str, Any] = {"key": int(key), "scancode": int(scancode), "mods": int(mods)}
+        normalized = mode.lower()
+        if normalized == "tap":
+            params.update({"mode": "tap", "hold_ms": max(1, min(int(hold_ms), 5000))})
+        elif normalized in {"press", "release"}:
+            params["action"] = 1 if normalized == "press" else 0
+        else:
+            return {"ok": False, "error": "invalid_key_mode", "detail": "mode must be tap, press, or release"}
+        client = AgentContainerClient(self.supervisor.device_udid, self.supervisor.bundle_id)
+        return await self.supervisor._agent_request(client, state, "input/key", params, timeout=10)
+
     async def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         method = request.get("method")
         params = request.get("params") or {}
@@ -129,6 +207,10 @@ class AgentServer:
             return await self.supervisor.stage_payload(**params)
         if method == "collect":
             return await self.supervisor.collect(**params)
+        if method == "query_logs":
+            return await self._query_logs(**params)
+        if method == "input_key":
+            return await self._input_key(**params)
         if method == "shutdown":
             self._stop.set()
             return {"ok": True, "stopping": True}
