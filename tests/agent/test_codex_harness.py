@@ -54,7 +54,8 @@ class OutputBudgetTests(unittest.TestCase):
             full = Path(compact["_full_output"])
             self.assertTrue(full.is_file())
             self.assertEqual(json.loads(full.read_text())["raw"], value["raw"])
-            self.assertLess(len(json.dumps(compact).encode()), 16_000)
+            encoded = (json.dumps(compact, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            self.assertLessEqual(len(encoded), 4096)
 
 
 class FailureFingerprintTests(unittest.TestCase):
