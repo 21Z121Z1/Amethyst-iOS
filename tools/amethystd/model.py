@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from time import time
@@ -88,6 +90,23 @@ PROCESS_SCOPED_STAGES = {
     Stage.MEASURING,
 }
 
+_VOLATILE_HEX = re.compile(r"0x[0-9A-Fa-f]+")
+_VOLATILE_UUID = re.compile(r"\b[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\b")
+_VOLATILE_NUMBER = re.compile(r"\b\d{2,}\b")
+
+
+def failure_fingerprint(failure: FailureClass, detail: str) -> str:
+    """Fingerprint the failure class plus normalized detail.
+
+    Addresses, UUIDs, PIDs, ports, and timestamps are intentionally normalized
+    so Codex can recognize an identical failing layer across fresh device runs.
+    """
+    normalized = _VOLATILE_UUID.sub("<uuid>", detail)
+    normalized = _VOLATILE_HEX.sub("<hex>", normalized)
+    normalized = _VOLATILE_NUMBER.sub("<n>", normalized)
+    material = f"{failure.value}\n{normalized.strip()[:4096]}".encode("utf-8", errors="replace")
+    return hashlib.sha256(material).hexdigest()[:20]
+
 
 @dataclass
 class RunState:
@@ -97,6 +116,7 @@ class RunState:
     stage: Stage = Stage.IDLE
     failure: FailureClass | None = None
     failure_detail: str | None = None
+    failure_fingerprint: str | None = None
     pid: int | None = None
     process_generation: str | None = None
     jit_exec_ready: bool = False
@@ -131,6 +151,7 @@ class RunState:
                 self.stage = Stage.APP_LAUNCHED
             self.failure = None
             self.failure_detail = None
+            self.failure_fingerprint = None
         elif first_identity and self.stage == Stage.IDLE:
             self.stage = Stage.APP_LAUNCHED
         return changed
@@ -148,6 +169,7 @@ class RunState:
     def fail(self, failure: FailureClass, detail: str, *, blocked: bool = False) -> None:
         self.failure = failure
         self.failure_detail = detail
+        self.failure_fingerprint = failure_fingerprint(failure, detail)
         self.stage = Stage.BLOCKED if blocked else Stage.FAIL
         self.updated_at = time()
 
