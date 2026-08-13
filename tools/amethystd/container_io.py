@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -12,6 +13,9 @@ from uuid import uuid4
 
 _SAFE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _REMOTE_DOCUMENTS = "/Documents"
+_STREAM_PREFIXES = ("agent-events/", "agent-lab/")
+_STREAM_FILES = {"latestlog.txt"}
+_STREAM_CHUNK_BYTES = 64 * 1024
 
 
 def safe_component(value: str, label: str) -> str:
@@ -28,13 +32,20 @@ def documents_path(relative: str) -> str:
 
 
 class AgentContainerClient:
-    """Documents-relative Agent v2 transport using current pymobiledevice3 async House Arrest APIs."""
+    """Documents-relative Agent v2 transport using current pymobiledevice3 async House Arrest APIs.
+
+    Growing text artifacts are read through the app-side bounded `artifact/read`
+    action. The host keeps a cursor and transfers only new bytes after the first
+    observation instead of repeatedly pulling an ever-growing file through AFC.
+    """
 
     def __init__(self, udid: str, bundle_id: str) -> None:
         if not udid:
             raise ValueError("device UDID is required")
         self.udid = udid
         self.bundle_id = bundle_id
+        self._stream_cache: dict[str, bytearray] = {}
+        self._stream_offsets: dict[str, int] = {}
 
     @asynccontextmanager
     async def _afc(self) -> AsyncIterator[Any]:
@@ -54,7 +65,11 @@ class AgentContainerClient:
             ) as afc:
                 yield afc
 
-    async def read_optional(self, relative: str) -> bytes | None:
+    @staticmethod
+    def _is_stream_artifact(relative: str) -> bool:
+        return relative in _STREAM_FILES or relative.startswith(_STREAM_PREFIXES)
+
+    async def _read_direct_optional(self, relative: str) -> bytes | None:
         try:
             from pymobiledevice3.exceptions import AfcFileNotFoundError
         except ImportError as exc:
@@ -64,6 +79,69 @@ class AgentContainerClient:
                 return await afc.get_file_contents(documents_path(relative))
             except AfcFileNotFoundError:
                 return None
+
+    async def read_chunk(self, relative: str, *, offset: int, max_bytes: int = _STREAM_CHUNK_BYTES) -> dict[str, Any]:
+        """Read one bounded UTF-8/binary-safe chunk through Agent v2.
+
+        Negative offsets are interpreted by the app relative to EOF, which is
+        useful for Codex-facing tail queries that should not ingest full logs.
+        """
+        max_bytes = max(0, min(int(max_bytes), _STREAM_CHUNK_BYTES))
+        request = {
+            "protocol": "amethyst-agent/v2",
+            "request_id": uuid4().hex,
+            "run_id": "transport",
+            "action": "artifact/read",
+            "params": {"path": relative, "offset": int(offset), "max_bytes": max_bytes},
+        }
+        response = await self.request(request, timeout=20)
+        if not response.get("ok"):
+            return response
+        encoded = response.get("data_b64") or ""
+        try:
+            data = base64.b64decode(encoded, validate=True) if encoded else b""
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("artifact/read returned invalid base64") from exc
+        result = dict(response)
+        result.pop("data_b64", None)
+        result["data"] = data
+        return result
+
+    async def _read_stream_optional(self, relative: str) -> bytes | None:
+        cache = self._stream_cache.setdefault(relative, bytearray())
+        offset = self._stream_offsets.get(relative, 0)
+        while True:
+            chunk = await self.read_chunk(relative, offset=offset)
+            if chunk.get("state") == "rejected" and "unsupported" in str(chunk.get("error", "")).lower():
+                value = await self._read_direct_optional(relative)
+                if value is not None:
+                    self._stream_cache[relative] = bytearray(value)
+                    self._stream_offsets[relative] = len(value)
+                return value
+            if not chunk.get("ok"):
+                if chunk.get("exists") is False:
+                    return None
+                raise RuntimeError(f"artifact/read failed for {relative}: {chunk.get('error') or chunk.get('state')}")
+            if chunk.get("exists") is False:
+                self._stream_cache.pop(relative, None)
+                self._stream_offsets.pop(relative, None)
+                return None
+            if chunk.get("reset"):
+                cache = bytearray()
+                self._stream_cache[relative] = cache
+                offset = int(chunk.get("offset", 0))
+            data = chunk.get("data") or b""
+            cache.extend(data)
+            offset = int(chunk.get("next_offset", offset + len(data)))
+            self._stream_offsets[relative] = offset
+            if chunk.get("eof", True) or not data:
+                break
+        return bytes(cache)
+
+    async def read_optional(self, relative: str) -> bytes | None:
+        if self._is_stream_artifact(relative):
+            return await self._read_stream_optional(relative)
+        return await self._read_direct_optional(relative)
 
     async def submit(self, request: dict[str, Any]) -> str:
         request_id = safe_component(str(request["request_id"]), "request_id")
@@ -83,7 +161,7 @@ class AgentContainerClient:
 
     async def response(self, request_id: str) -> dict[str, Any] | None:
         request_id = safe_component(request_id, "request_id")
-        raw = await self.read_optional(f"agent-responses/{request_id}.json")
+        raw = await self._read_direct_optional(f"agent-responses/{request_id}.json")
         if raw is None:
             return None
         value = json.loads(raw.decode("utf-8"))
