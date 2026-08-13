@@ -17,6 +17,7 @@ class AgentServer:
     def __init__(self, store: StateStore | None = None) -> None:
         self.store = store or StateStore()
         self.supervisor = self._new_supervisor()
+        self._log_client: AgentContainerClient | None = None
         self.server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
 
@@ -28,6 +29,17 @@ class AgentServer:
             bundle_id=config.get("bundle_id"),
         )
 
+    def _log_container(self) -> AgentContainerClient:
+        if not self.supervisor.device_udid:
+            raise ValueError("device UDID is required")
+        if (
+            self._log_client is None
+            or self._log_client.udid != self.supervisor.device_udid
+            or self._log_client.bundle_id != self.supervisor.bundle_id
+        ):
+            self._log_client = AgentContainerClient(self.supervisor.device_udid, self.supervisor.bundle_id)
+        return self._log_client
+
     def _configure(self, *, device_udid: str | None = None, bundle_id: str | None = None) -> dict[str, Any]:
         current = self.store.load_config()
         if device_udid is not None:
@@ -37,6 +49,7 @@ class AgentServer:
         self.store.save_config(current)
         self.supervisor.close()
         self.supervisor = self._new_supervisor()
+        self._log_client = None
         return {
             "ok": True,
             "configuration": self.store.load_config(),
@@ -119,8 +132,7 @@ class AgentServer:
 
         limit = max(1, min(int(limit), 500))
         max_bytes = max(1024, min(int(max_bytes), 65536))
-        client = AgentContainerClient(self.supervisor.device_udid, self.supervisor.bundle_id)
-        chunk = await client.read_tail(relative, max_bytes=max_bytes)
+        chunk = await self._log_container().read_tail(relative, max_bytes=max_bytes)
         if not chunk.get("ok"):
             return chunk
         if chunk.get("exists") is False:
