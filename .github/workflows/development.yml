@@ -36,6 +36,20 @@ jobs:
       - name: Checkout repository submodules
         run: git submodule update --init --recursive
 
+      - name: Checkout validated Mithril DirectMetal
+        uses: actions/checkout@main
+        with:
+          repository: '21Z121Z1/Mithril-Wrapper'
+          ref: 'c04ae187fa36d93682df757a026ff29bb22bc19a'
+          path: 'mithril'
+          submodules: recursive
+
+      - name: Build and validate Mithril for iPhoneOS
+        run: |
+          export PATH=/opt/homebrew/bin:$PATH
+          ./mithril/scripts/build_iphoneos.sh
+          test -f "$GITHUB_WORKSPACE/mithril/output/libmithril.dylib"
+
       - name: Get gl4es latest commit hash
         id: gl4es-sha
         run: echo "::set-output name=sha::$(echo $(git ls-remote https://github.com/PojavLauncherTeam/gl4es-114-extra refs/heads/master | grep -io '^\S*'))"
@@ -80,9 +94,12 @@ jobs:
           git push
 
       - name: Build for ${{ matrix.platform_name }}
+        env:
+          MITHRIL_DYLIB: ${{ github.workspace }}/mithril/output/libmithril.dylib
         run: |
           export PATH=/opt/homebrew/bin:$PATH
           export SLIMMED=1
+          test -f "$MITHRIL_DYLIB"
           if [ "${{ matrix.platform_name }}" == "ios" ]; then
             # Build ipa and tipa for iOS
             gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
@@ -93,6 +110,21 @@ jobs:
           else
             # Build ipa only for everything else
             gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
+          fi
+
+      - name: Verify Mithril is bundled in the iOS payload
+        if: matrix.platform_name == 'ios'
+        run: |
+          DYLIB="$GITHUB_WORKSPACE/artifacts/Payload/AngelAuraAmethyst.app/Frameworks/libmithril.dylib"
+          test -f "$DYLIB"
+          file "$DYLIB"
+          lipo -info "$DYLIB"
+          vtool -show-build "$DYLIB" | grep -q 'platform IOS'
+          otool -D "$DYLIB" | tail -n +2 | grep -qx '@rpath/libmithril.dylib'
+          otool -L "$DYLIB" | grep -q '/System/Library/Frameworks/Metal.framework/Metal'
+          if otool -L "$DYLIB" | grep -q 'MoltenVK'; then
+            echo 'Mithril DirectMetal payload unexpectedly links MoltenVK' >&2
+            exit 1
           fi
 
       - name: Upload regular ipa

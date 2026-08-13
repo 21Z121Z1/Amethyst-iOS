@@ -133,6 +133,12 @@ NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion) {
 }
 
 #pragma mark Renderer
+static BOOL hasMithrilRenderer(void) {
+    NSString *relativePath = [NSString stringWithFormat:@"Frameworks/%s", RENDERER_NAME_MITHRIL];
+    NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:relativePath];
+    return [NSFileManager.defaultManager fileExistsAtPath:path];
+}
+
 NSArray* getRendererKeys(BOOL containsDefault) {
     NSMutableArray *array = @[
         @"auto",
@@ -142,6 +148,9 @@ NSArray* getRendererKeys(BOOL containsDefault) {
         @ RENDERER_NAME_VK_ZINK
     ].mutableCopy;
 
+    if (hasMithrilRenderer()) {
+        [array insertObject:@ RENDERER_NAME_MITHRIL atIndex:4];
+    }
     if (containsDefault) {
         [array insertObject:@"(default)" atIndex:0];
     }
@@ -160,6 +169,9 @@ NSArray* getRendererNames(BOOL containsDefault) {
         localize(@"preference.title.renderer.debug.zink", nil)
     ].mutableCopy;
 
+    if (hasMithrilRenderer()) {
+        [array insertObject:@"Mithril DirectMetal (experimental)" atIndex:4];
+    }
     if (containsDefault) {
         [array insertObject:@"(default)" atIndex:0];
     }

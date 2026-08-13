@@ -62,16 +62,30 @@ int pojavInitOpenGL() {
         set_gl_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE]) {
         set_gl_bridge_tbl();
+    } else if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
+        // Pin the renderer to the native Metal backend. Do not allow a future
+        // Mithril default change to route Amethyst through Vulkan/MoltenVK.
+        setenv("MITHRIL_BACKEND", "metal", 1);
+        set_gl_bridge_tbl();
     } else if ([renderer hasPrefix:@"libOSMesa"]) {
         setenv("GALLIUM_DRIVER","zink",1);
         set_osm_bridge_tbl();
+    } else {
+        NSLog(@"EGLBridge: unsupported renderer %@", renderer);
+        return 1;
     }
     JNI_LWJGL_changeRenderer(renderer.UTF8String);
-    // Preload renderer library
-    dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, RTLD_GLOBAL);
+
+    // Preload the selected GL implementation into the global namespace so
+    // LWJGL/JNA symbol lookup sees the exact same library as the EGL bridge.
+    NSString *rendererPath = [NSString stringWithFormat:@"@rpath/%@", renderer];
+    void *rendererHandle = dlopen(rendererPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
+    if (!rendererHandle) {
+        NSLog(@"EGLBridge: failed to preload %@: %s", rendererPath, dlerror());
+        return 1;
+    }
 
     return !br_init();
-    //return 0;
 }
 
 void pojavSetWindowHint(int hint, int value) {
@@ -110,7 +124,10 @@ void* pojavCreateContext(basic_render_window_t* contextSrc) {
     static BOOL inited = NO;
     if (!inited) {
         inited = YES;
-        pojavInitOpenGL();
+        if (pojavInitOpenGL() != 0) {
+            NSLog(@"EGLBridge: renderer initialization failed");
+            return NULL;
+        }
     }
 
     return br_init_context(contextSrc);
