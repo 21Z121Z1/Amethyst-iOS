@@ -120,7 +120,7 @@ class AgentServer:
         limit = max(1, min(int(limit), 500))
         max_bytes = max(1024, min(int(max_bytes), 65536))
         client = AgentContainerClient(self.supervisor.device_udid, self.supervisor.bundle_id)
-        chunk = await client.read_chunk(relative, offset=-max_bytes, max_bytes=max_bytes)
+        chunk = await client.read_tail(relative, max_bytes=max_bytes)
         if not chunk.get("ok"):
             return chunk
         if chunk.get("exists") is False:
