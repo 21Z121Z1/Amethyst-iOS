@@ -79,6 +79,37 @@ def summarize_for_agent(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _encoded_size(value: dict[str, Any]) -> int:
+    return len((json.dumps(value, sort_keys=True, separators=(",", ":"), default=str) + "\n").encode())
+
+
+def _minimal_summary(value: dict[str, Any], path: Path, raw_bytes: int, max_bytes: int) -> dict[str, Any]:
+    result: dict[str, Any] = {"ok": bool(value.get("ok"))}
+    for key in ("error", "failure", "failure_fingerprint", "stage", "run_id", "phase", "mode", "key"):
+        if key in value:
+            result[key] = value[key]
+    detail = value.get("detail")
+    if isinstance(detail, str):
+        result["detail"] = _trim_text(detail, 1024)
+    state = value.get("state")
+    if isinstance(state, dict):
+        result["state"] = {
+            key: (_trim_text(state[key], 1024) if key == "failure_detail" else state[key])
+            for key in (
+                "run_id", "stage", "failure", "failure_detail", "failure_fingerprint",
+                "pid", "process_generation", "app_state",
+            )
+            if key in state
+        }
+    result.update({
+        "_output_truncated": True,
+        "_full_output": str(path),
+        "_full_output_bytes": raw_bytes,
+        "_max_output_bytes": max_bytes,
+    })
+    return result
+
+
 def bounded_result(value: dict[str, Any], root: Path, *, max_bytes: int | None = None) -> dict[str, Any]:
     if max_bytes is None:
         try:
@@ -96,8 +127,20 @@ def bounded_result(value: dict[str, Any], root: Path, *, max_bytes: int | None =
     path.write_bytes(raw)
 
     result = summarize_for_agent(value)
-    result["_output_truncated"] = True
-    result["_full_output"] = str(path)
-    result["_full_output_bytes"] = len(raw)
-    result["_max_output_bytes"] = max_bytes
+    result.update({
+        "_output_truncated": True,
+        "_full_output": str(path),
+        "_full_output_bytes": len(raw),
+        "_max_output_bytes": max_bytes,
+    })
+    if _encoded_size(result) > max_bytes:
+        result = _minimal_summary(value, path, len(raw), max_bytes)
+    if _encoded_size(result) > max_bytes:
+        # The minimum supported budget is 4 KiB; this last reduction protects
+        # pathological run IDs/paths while preserving the pointer to full data.
+        result.pop("detail", None)
+        state = result.get("state")
+        if isinstance(state, dict):
+            state.pop("failure_detail", None)
+            state.pop("process_generation", None)
     return result
