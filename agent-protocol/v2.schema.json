@@ -14,7 +14,6 @@
         "status",
         "probe/runtime",
         "probe/jit",
-        "artifact/read",
         "input/key",
         "input/mouse",
         "profile/set",
@@ -33,15 +32,10 @@
         "quickPlaySingleplayer": { "type": "string", "maxLength": 512 },
         "quick_play_singleplayer": { "type": "string", "maxLength": 512 },
         "force": { "type": "boolean" },
-        "path": { "type": "string", "maxLength": 512 },
-        "offset": { "type": "integer" },
-        "max_bytes": { "type": "integer", "minimum": 0, "maximum": 65536 },
         "key": { "type": "integer", "minimum": 0, "maximum": 512 },
         "action": { "type": "integer", "enum": [0, 1] },
         "scancode": { "type": "integer", "minimum": 0 },
         "mods": { "type": "integer", "minimum": 0, "maximum": 255 },
-        "mode": { "type": "string", "enum": ["tap"] },
-        "hold_ms": { "type": "integer", "minimum": 1, "maximum": 5000 },
         "button": { "type": "integer", "minimum": 0, "maximum": 7 }
       }
     }
