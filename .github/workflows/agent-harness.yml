@@ -83,7 +83,7 @@ jobs:
       - name: Install native build prerequisites
         run: brew install ldid wget
       - name: Build native target
-        run: make native PLATFORM=2 MAKEFLAGS=-j2
+        run: make native PLATFORM=2 BOOTJDK="$JAVA_HOME/bin" MAKEFLAGS=-j2
       - name: Verify native executable shape
         run: |
           python3 - <<'PY'
