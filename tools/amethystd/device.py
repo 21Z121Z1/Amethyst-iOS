@@ -134,7 +134,14 @@ class DeviceController:
         if not prefix:
             raise RuntimeError("pymobiledevice3 is unavailable")
         target.mkdir(parents=True, exist_ok=True)
-        return self.runner.run([*prefix, "crash", "pull", str(target)], timeout=120, env=self.pmd3_env())
+        crash_match = os.environ.get(
+            "AMETHYST_CRASH_MATCH", r"^(AngelAuraAmethyst|Minecraft|libmithril)"
+        )
+        return self.runner.run(
+            [*prefix, "crash", "pull", "--match", crash_match, str(target)],
+            timeout=120,
+            env=self.pmd3_env(),
+        )
 
     def screenshot(self, target: Path) -> CommandResult:
         prefix = self.pmd3_prefix()

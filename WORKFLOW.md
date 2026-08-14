@@ -17,6 +17,10 @@ When `pymobiledevice3 usbmux list` reports the target as `Network` rather than
 restarting the daemon. The default remains `USB`, and unsupported values fail
 closed.
 
+Automatic crash collection uses a bounded app-focused basename match by
+default. Set `AMETHYST_CRASH_MATCH` only when a diagnostic run needs a wider
+device crash set.
+
 Use `./tools/amethystctl` thereafter. If a stale daemon belongs to another Python interpreter:
 
 ```sh

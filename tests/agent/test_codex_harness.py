@@ -12,6 +12,7 @@ from pathlib import Path
 from tools.amethystctl import glfw_key
 from tools.amethystd.agent_output import bounded_result
 from tools.amethystd.container_io import AgentContainerClient, _STREAM_CHUNK_BYTES, _device_connection_type
+from tools.amethystd.device import CommandResult, DeviceController
 from tools.amethystd.debug_package import AgentDebugBuildError, MH_EXECUTE, macho_filetypes, require_macho_executable
 from tools.amethystd.frame_metrics import analyze_png, compare_png_frames
 from tools.amethystd.model import FailureClass, failure_fingerprint
@@ -134,6 +135,24 @@ class DeviceTransportTests(unittest.TestCase):
         with patch.dict(os.environ, {"AMETHYST_DEVICE_CONNECTION_TYPE": "WiFi"}):
             with self.assertRaisesRegex(ValueError, "must be USB or Network"):
                 _device_connection_type()
+
+    def test_crash_collection_uses_bounded_default_match(self) -> None:
+        from unittest.mock import patch
+
+        class FakeRunner:
+            def __init__(self) -> None:
+                self.argv: list[str] | None = None
+
+            def run(self, argv, **_kwargs):
+                self.argv = list(argv)
+                return CommandResult(list(argv), 0, "", "")
+
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"AMETHYST_CRASH_MATCH": "^TestCrash"}):
+                result = DeviceController("udid", runner).pull_crashes(Path(tmp) / "crash")
+        self.assertTrue(result.ok)
+        self.assertEqual(runner.argv[-3:], ["--match", "^TestCrash", str(Path(tmp) / "crash")])
 
 
 class FrameMetricsTests(unittest.TestCase):
