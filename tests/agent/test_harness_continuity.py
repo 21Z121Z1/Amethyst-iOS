@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -98,6 +99,28 @@ class TransportRecoveryTests(unittest.TestCase):
         self.assertEqual(data, b"ok")
         self.assertEqual(attempts, 2)
 
+    def test_exhausted_transient_read_is_classified_as_timeout(self) -> None:
+        class Missing(Exception):
+            pass
+
+        attempts = 0
+        client = AgentContainerClient("device-1", "org.example.AgentDebug")
+
+        @asynccontextmanager
+        async def broken_afc():
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("SSL record layer failure")
+            yield  # pragma: no cover
+
+        client._afc = broken_afc  # type: ignore[method-assign]
+        fake_errors = type("Errors", (), {"AfcFileNotFoundError": Missing})
+        with patch.dict("sys.modules", {"pymobiledevice3.exceptions": fake_errors}):
+            with patch("tools.amethystd.container_io.asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaisesRegex(TimeoutError, "AFC read transport remained unavailable"):
+                    asyncio.run(client._read_direct_optional("latestlog.txt"))
+        self.assertEqual(attempts, 3)
+
 
 class RetryIsolationTests(unittest.TestCase):
     def test_infrastructure_failures_do_not_poison_candidate_retry_budget(self) -> None:
@@ -119,6 +142,30 @@ class RetryIsolationTests(unittest.TestCase):
             store.record_failure(signature, failure="MC_READY_TIMEOUT", fingerprint="semantic")
             self.assertTrue(store.retry_status(signature)["blocked"])
 
+    def test_pre_upgrade_infrastructure_block_is_ignored_on_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp)
+            signature = "legacy-attempt"
+            store.retry_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "attempts": {
+                            signature: {
+                                "failure": "AGENT_UNREACHABLE",
+                                "failure_fingerprint": "old-network-failure",
+                                "consecutive_same_failure": 2,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status = store.retry_status(signature)
+            self.assertFalse(status["blocked"])
+            self.assertEqual(status["consecutive_same_failure"], 0)
+            self.assertTrue(status["ignored_as_infrastructure"])
+
 
 class ConsumerIdentityContractTests(unittest.TestCase):
     def test_hot_renderer_is_prebound_before_jli_and_native_bridge_is_not_semantic_ready(self) -> None:
@@ -135,7 +182,7 @@ class ConsumerIdentityContractTests(unittest.TestCase):
         self.assertIn('AgentControlEmitActiveEvent(@"renderer_bridge_ready"', bridge)
         self.assertNotIn('AgentControlEmitActiveEvent(@"renderer_ready"', bridge)
 
-    def test_mc262_probe_proves_actual_lwjgl_function_provider(self) -> None:
+    def test_mc262_probe_proves_actual_lwjgl_function_provider_without_forcing_early_init(self) -> None:
         root = Path(__file__).resolve().parents[2]
         probe = (
             root
@@ -147,6 +194,7 @@ class ConsumerIdentityContractTests(unittest.TestCase):
         self.assertIn('provider.getFunctionAddress("glDrawElements")', probe)
         self.assertIn('emit("renderer_ready", fields)', probe)
         self.assertIn("lwjgl_function_provider_does_not_match_requested_staged_image", probe)
+        self.assertNotIn('emitRendererConsumerIdentity("client_initializer")', probe)
 
 
 if __name__ == "__main__":
