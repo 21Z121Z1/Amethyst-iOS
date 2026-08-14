@@ -190,10 +190,13 @@ int pojavInitOpenGL() {
         return 1;
     }
 
+    // This proves only the bridge's own handle.  It is deliberately not the
+    // semantic RENDERER_READY gate: the MC26.2 probe must independently prove
+    // the actual LWJGL GL FunctionProvider and its function addresses.
     NSMutableDictionary *ready = [provenance mutableCopy];
     ready[@"renderer"] = renderer ?: @"<unset>";
     ready[@"hot_payload"] = @([rendererPath hasPrefix:@"/"]);
-    AgentControlEmitActiveEvent(@"renderer_ready", ready);
+    AgentControlEmitActiveEvent(@"renderer_bridge_ready", ready);
     return 0;
 }
 
