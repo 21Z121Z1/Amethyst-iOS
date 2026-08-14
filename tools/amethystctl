@@ -7,4 +7,8 @@ if [ ! -x "$PYTHON" ]; then
   echo "amethystctl: harness Python environment is missing; run $ROOT/tools/bootstrap-agent" >&2
   exit 2
 fi
+if [ "${1:-}" = "mithril" ]; then
+  shift
+  exec "$PYTHON" -m tools.amethystd.mithril_hot_swap "$@"
+fi
 exec "$PYTHON" "$ROOT/tools/amethystctl.py" "$@"
