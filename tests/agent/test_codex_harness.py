@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from tools.amethystctl import glfw_key
 from tools.amethystd.agent_output import bounded_result
-from tools.amethystd.container_io import AgentContainerClient, _STREAM_CHUNK_BYTES
+from tools.amethystd.container_io import AgentContainerClient, _STREAM_CHUNK_BYTES, _device_connection_type
 from tools.amethystd.debug_package import AgentDebugBuildError, MH_EXECUTE, macho_filetypes, require_macho_executable
 from tools.amethystd.frame_metrics import analyze_png, compare_png_frames
 from tools.amethystd.model import FailureClass, failure_fingerprint
@@ -100,6 +101,39 @@ class ContainerStreamingTests(unittest.TestCase):
         self.assertEqual(len(data), size)
         self.assertEqual(afc.requests, [_STREAM_CHUNK_BYTES, _STREAM_CHUNK_BYTES, 123])
         self.assertTrue(afc.closed)
+
+
+class DeviceTransportTests(unittest.TestCase):
+    def test_connection_type_reaches_pymobiledevice3_and_is_fail_closed(self) -> None:
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, patch
+
+        @asynccontextmanager
+        async def fake_context():
+            yield object()
+
+        with patch.dict(os.environ, {"AMETHYST_DEVICE_CONNECTION_TYPE": "Network"}):
+            with patch("pymobiledevice3.lockdown.create_using_usbmux", new_callable=AsyncMock) as create_lockdown:
+                with patch(
+                    "pymobiledevice3.services.house_arrest.HouseArrestService.create",
+                    new_callable=AsyncMock,
+                ) as create_house_arrest:
+                    create_lockdown.return_value = fake_context()
+                    create_house_arrest.return_value = fake_context()
+                    client = AgentContainerClient("udid", "bundle")
+
+                    async def exercise() -> None:
+                        async with client._afc():
+                            pass
+
+                    asyncio.run(exercise())
+                    create_lockdown.assert_awaited_once_with(
+                        serial="udid", autopair=False, connection_type="Network"
+                    )
+                    create_house_arrest.assert_awaited_once()
+        with patch.dict(os.environ, {"AMETHYST_DEVICE_CONNECTION_TYPE": "WiFi"}):
+            with self.assertRaisesRegex(ValueError, "must be USB or Network"):
+                _device_connection_type()
 
 
 class FrameMetricsTests(unittest.TestCase):

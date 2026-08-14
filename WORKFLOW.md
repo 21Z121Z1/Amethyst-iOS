@@ -12,6 +12,11 @@ Make real-device Amethyst/Minecraft debugging a resumable, evidence-driven trans
 ./tools/amethystctl doctor
 ```
 
+When `pymobiledevice3 usbmux list` reports the target as `Network` rather than
+`USB`, export `AMETHYST_DEVICE_CONNECTION_TYPE=Network` before starting or
+restarting the daemon. The default remains `USB`, and unsupported values fail
+closed.
+
 Use `./tools/amethystctl` thereafter. If a stale daemon belongs to another Python interpreter:
 
 ```sh

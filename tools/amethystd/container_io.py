@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,14 @@ _REMOTE_DOCUMENTS = "/Documents"
 _STREAM_PREFIXES = ("agent-events/", "agent-lab/")
 _STREAM_FILES = {"latestlog.txt"}
 _STREAM_CHUNK_BYTES = 256 * 1024
+_DEVICE_CONNECTION_TYPES = frozenset({"USB", "Network"})
+
+
+def _device_connection_type() -> str:
+    connection_type = os.environ.get("AMETHYST_DEVICE_CONNECTION_TYPE", "USB")
+    if connection_type not in _DEVICE_CONNECTION_TYPES:
+        raise ValueError("AMETHYST_DEVICE_CONNECTION_TYPE must be USB or Network")
+    return connection_type
 
 
 def safe_component(value: str, label: str) -> str:
@@ -59,7 +68,7 @@ class AgentContainerClient:
             ) from exc
 
         async with await create_using_usbmux(
-            serial=self.udid, autopair=False, connection_type="USB"
+            serial=self.udid, autopair=False, connection_type=_device_connection_type()
         ) as lockdown:
             async with await HouseArrestService.create(
                 lockdown, self.bundle_id, documents_only=True
