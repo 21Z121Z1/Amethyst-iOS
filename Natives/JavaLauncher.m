@@ -11,6 +11,7 @@
 
 #include "utils.h"
 
+#import "AgentPayload.h"
 #import "ios_uikit_bridge.h"
 #import "JavaLauncher.h"
 #import "LauncherPreferences.h"
@@ -37,6 +38,21 @@ static NSString *JavaLauncherRebaseContainerPaths(NSString *value) {
     return [expression stringByReplacingMatchesInString:value
         options:0 range:NSMakeRange(0, value.length)
         withTemplate:[containerRoot stringByAppendingString:@"/Documents"]];
+}
+
+static NSString *JavaLauncherOpenGLLibraryArgument(const char *rendererName, NSError **error) {
+    if (error) *error = nil;
+    if (!rendererName || !rendererName[0]) return nil;
+    if (strcmp(rendererName, RENDERER_NAME_MITHRIL) != 0) return @(rendererName);
+
+    // Resolve the active content-addressed Mithril image before JLI_Launch.
+    // LWJGL loads GL when org.lwjgl.opengl.GL is initialized, which can happen
+    // before pojavInitOpenGL().  A late System.setProperty() therefore cannot
+    // be used as the authoritative hot-payload selector.
+    NSString *hot = AgentPayloadResolveActiveFile(@"mithril", @ RENDERER_NAME_MITHRIL, error);
+    if (hot) return hot;
+    if (error && *error) return nil;
+    return @(rendererName);
 }
 
 // Pojav's bundled launcher.jar only consumes string entries from the
@@ -318,14 +334,26 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
     //margv[++margc] = "-Dorg.lwjgl.util.NoChecks=true";
     margv[++margc] = "-Dlog4j2.formatMsgNoLookups=true";
 
-    // Preset OpenGL libname
+    // Resolve the hot renderer before the JVM starts.  This is the only point
+    // early enough to guarantee LWJGL's first GL initialization sees the staged
+    // absolute path rather than the bundled Frameworks basename.
     const char *glLibName = getenv("POJAV_RENDERER");
     if (glLibName) {
         if (!strcmp(glLibName, "auto")) {
             // workaround only applies to 1.20.2+
             glLibName = RENDERER_NAME_MTL_ANGLE;
         }
-        margv[++margc] = [NSString stringWithFormat:@"-Dorg.lwjgl.opengl.libname=%s", glLibName].UTF8String;
+        NSError *rendererPayloadError = nil;
+        NSString *glLibraryArgument = JavaLauncherOpenGLLibraryArgument(glLibName, &rendererPayloadError);
+        if (!glLibraryArgument) {
+            NSLog(@"[JavaLauncher] Active renderer payload rejected before JVM launch: %@", rendererPayloadError.localizedDescription);
+            UIKit_returnToSplitView();
+            showDialog(localize(@"Error", nil), rendererPayloadError.localizedDescription ?: @"Active renderer payload verification failed");
+            return 1;
+        }
+        setenv("AMETHYST_OPENGL_LIBRARY_PATH", glLibraryArgument.UTF8String, 1);
+        NSLog(@"[JavaLauncher] LWJGL OpenGL library prebound to %@", glLibraryArgument);
+        margv[++margc] = [NSString stringWithFormat:@"-Dorg.lwjgl.opengl.libname=%@", glLibraryArgument].UTF8String;
     }
 
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
