@@ -11,6 +11,21 @@ from typing import Any
 from .model import RunState
 
 
+_INFRASTRUCTURE_FAILURES = frozenset({
+    "DEVICE_NOT_FOUND",
+    "DEVICE_DISCONNECTED",
+    "DEVICE_LOCKED",
+    "DEVELOPER_MODE_REQUIRED",
+    "INSTALL_UNKNOWN",
+    "AGENT_UNREACHABLE",
+    "STALE_DEBUGSERVER",
+    "JIT_PROCESSOR_UNCONFIGURED",
+    "JIT_ATTACH_FAILURE",
+    "JIT_MODE_INSUFFICIENT",
+    "JIT_VERIFICATION_FAILURE",
+})
+
+
 class StateStore:
     def __init__(self, root: Path | str | None = None) -> None:
         configured = root or os.environ.get("AMETHYST_AGENT_HOME") or ".amethyst-agent"
@@ -124,7 +139,20 @@ class StateStore:
             "last_failure_fingerprint": entry.get("failure_fingerprint"),
         }
 
+    @staticmethod
+    def failure_affects_candidate_retry(failure: str) -> bool:
+        """Only semantic candidate failures participate in unchanged-failure blocking.
+
+        Device, transport and JIT orchestration failures remain visible in each
+        run artifact but must not consume the two-strike renderer experiment
+        budget. Otherwise a flaky Network/AFC or stale debugserver incident can
+        prevent the next valid A/B attempt without any renderer evidence.
+        """
+        return failure not in _INFRASTRUCTURE_FAILURES
+
     def record_failure(self, signature: str, *, failure: str, fingerprint: str) -> None:
+        if not self.failure_affects_candidate_retry(failure):
+            return
         data = self._retry_data()
         previous = data["attempts"].get(signature) or {}
         same = previous.get("failure_fingerprint") == fingerprint
