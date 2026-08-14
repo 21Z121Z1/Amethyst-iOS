@@ -81,6 +81,11 @@ jobs:
           ./tools/amethystctl payload clear --help >/dev/null
           ./tools/amethystctl daemon --help >/dev/null
           ./tools/amethystctl doctor --host-only | tee ci-evidence/host-preflight.json
+      - name: Verify CoreDevice fresh-process launch contract
+        run: |
+          set -o pipefail
+          xcrun devicectl help device process launch 2>&1 | tee ci-evidence/devicectl-process-launch-help.txt
+          grep -q -- '--terminate-existing' ci-evidence/devicectl-process-launch-help.txt
       - name: Exercise implicit daemon startup and recovery lifecycle
         env:
           AMETHYST_AGENT_HOME: /tmp/amethyst-ci-daemon
@@ -160,11 +165,13 @@ jobs:
           shasum -a 256 "$APP" | tee ci-native-evidence/sha256.txt
           dwarfdump --uuid "$APP" | tee ci-native-evidence/uuid.txt
           codesign -dvvv "$APP" 2>ci-native-evidence/codesign.txt || true
-          strings "$APP" | grep -E 'game_session_generation|HOT_PAYLOAD_PROVENANCE_MISMATCH|renderer_symbols_resolved_to_different_image|provenance_ok' | sort -u | tee ci-native-evidence/harness-markers.txt
+          strings "$APP" | grep -E 'game_session_generation|HOT_PAYLOAD_PROVENANCE_MISMATCH|renderer_symbols_resolved_to_different_image|provenance_ok|renderer_bridge_ready|AMETHYST_OPENGL_LIBRARY_PATH' | sort -u | tee ci-native-evidence/harness-markers.txt
           grep -q 'game_session_generation' ci-native-evidence/harness-markers.txt
           grep -q 'HOT_PAYLOAD_PROVENANCE_MISMATCH' ci-native-evidence/harness-markers.txt
           grep -q 'renderer_symbols_resolved_to_different_image' ci-native-evidence/harness-markers.txt
           grep -q 'provenance_ok' ci-native-evidence/harness-markers.txt
+          grep -q 'renderer_bridge_ready' ci-native-evidence/harness-markers.txt
+          grep -q 'AMETHYST_OPENGL_LIBRARY_PATH' ci-native-evidence/harness-markers.txt
           cp "$APP" ci-native-evidence/AngelAuraAmethyst
           printf 'commit=%s\n' "$GITHUB_SHA" | tee ci-native-evidence/provenance.txt
       - name: Upload native build evidence
