@@ -59,6 +59,25 @@ class StoreTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_minecraft_262_build_contract_uses_jdk25_not_jdk8(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        makefile = (root / "Makefile").read_text(encoding="utf-8")
+        workflow = (root / ".github" / "workflows" / "agent-harness.yml").read_text(encoding="utf-8")
+        native_job = workflow.split("  native-build:", 1)[1]
+        self.assertIn("java_home -v 25", makefile)
+        self.assertIn("BOOTJDK_VERSION", makefile)
+        self.assertIn("Minecraft 26.2 build requires JDK 25", makefile)
+        self.assertIn("java-version: '25'", native_job)
+        self.assertNotIn("java-version: '8'", native_job)
+
+    def test_renderer_provenance_contract_uses_provider_handle_not_global_lookup(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "Natives" / "egl_bridge.m").read_text(encoding="utf-8")
+        self.assertIn("dlsym(rendererHandle, symbol.UTF8String)", source)
+        self.assertIn('@"symbol_images": providerImages', source)
+        self.assertIn('@"default_symbol_images": defaultImages', source)
+        self.assertIn("RTLD_DEFAULT is only a", source)
+
     def test_safe_components_reject_paths(self) -> None:
         for bad in ("../x", "a/b", "", "a b"):
             with self.assertRaises(ValueError):

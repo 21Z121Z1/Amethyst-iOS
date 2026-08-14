@@ -139,8 +139,8 @@ jobs:
           submodules: recursive
       - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
-          distribution: zulu
-          java-version: '8'
+          distribution: temurin
+          java-version: '25'
       - name: Install native build prerequisites
         run: brew install ldid wget
       - name: Build native target

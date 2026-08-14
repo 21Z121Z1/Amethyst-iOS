@@ -56,12 +56,12 @@ OSVER       := $(shell sw_vers -productVersion | cut -b 1-2)
 ifeq ($(shell sw_vers -productName),macOS)
 IOS         := 0
 SDKPATH     ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
-BOOTJDK     ?= $(shell /usr/libexec/java_home -v 1.8)/bin
+BOOTJDK     ?= $(shell /usr/libexec/java_home -v 25)/bin
 $(warning Building on macOS.)
 else
 IOS         := 1
 SDKPATH     ?= /usr/share/SDKs/iPhoneOS.sdk
-BOOTJDK     ?= /usr/lib/jvm/java-8-openjdk/bin
+BOOTJDK     ?= /usr/lib/jvm/java-25-openjdk/bin
 ifeq ($(shell test "$(OSVER)" -gt 14; echo $$?),0)
 PREFIX      ?= /var/jb/
 else
@@ -187,13 +187,12 @@ $(error You need to install cmake)
 endif
 
 ifneq ($(call METHOD_DEPCHECK,$(BOOTJDK)/javac -version),1)
-$(error You need to install JDK 8)
+$(error Minecraft 26.2 build requires JDK 25; set BOOTJDK to a JDK 25 bin directory)
 endif
 
-ifeq ($(IOS),0)
-ifeq ($(filter 1.8.0,$(shell $(BOOTJDK)/javac -version &> javaver.txt && cat javaver.txt | cut -b 7-11 && rm -rf javaver.txt)),)
-$(error You need to install JDK 8)
-endif
+BOOTJDK_VERSION := $(shell $(BOOTJDK)/javac -version 2>&1 | sed -nE 's/.* ([0-9]+)(\..*)?/\1/p')
+ifneq ($(BOOTJDK_VERSION),25)
+$(error Minecraft 26.2 build requires JDK 25; detected javac $(BOOTJDK_VERSION))
 endif
 
 ifneq ($(call METHOD_DEPCHECK,ldid),1)

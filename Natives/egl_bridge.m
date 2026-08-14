@@ -41,23 +41,35 @@ static NSDictionary *RendererProvenance(void *rendererHandle, NSString *renderer
     BOOL hot = [rendererPath hasPrefix:@"/"];
     NSString *expected = hot ? RendererCanonicalPath(rendererPath) : nil;
     NSArray<NSString *> *symbols = @[ @"eglGetProcAddress", @"eglMakeCurrent", @"glGetString", @"glGetIntegerv", @"glDrawElements" ];
-    NSMutableDictionary *images = [NSMutableDictionary dictionary];
+    NSMutableDictionary *providerImages = [NSMutableDictionary dictionary];
+    NSMutableDictionary *defaultImages = [NSMutableDictionary dictionary];
     BOOL ok = YES;
+    BOOL defaultMatch = YES;
     for (NSString *symbol in symbols) {
-        void *address = dlsym(RTLD_DEFAULT, symbol.UTF8String);
-        NSString *image = RendererImagePath(address);
-        images[symbol] = image ?: @"<missing>";
-        if (hot && (!image || ![image isEqualToString:expected])) ok = NO;
+        // LWJGL's macOS FunctionProvider uses dlsym on the SharedLibrary handle
+        // returned by dlopen(org.lwjgl.opengl.libname). RTLD_DEFAULT is only a
+        // diagnostic view: a bundled image with the same exported symbols may
+        // legitimately win that global lookup before a hot image.
+        void *providerAddress = rendererHandle ? dlsym(rendererHandle, symbol.UTF8String) : NULL;
+        NSString *providerImage = RendererImagePath(providerAddress);
+        providerImages[symbol] = providerImage ?: @"<missing>";
+        if (hot && (!providerImage || ![providerImage isEqualToString:expected])) ok = NO;
+
+        void *defaultAddress = dlsym(RTLD_DEFAULT, symbol.UTF8String);
+        NSString *defaultImage = RendererImagePath(defaultAddress);
+        defaultImages[symbol] = defaultImage ?: @"<missing>";
+        if (hot && (!defaultImage || ![defaultImage isEqualToString:expected])) defaultMatch = NO;
     }
-    NSString *loadedImage = RendererImagePath(dlsym(rendererHandle, "glGetString"));
-    if (hot && (!loadedImage || ![loadedImage isEqualToString:expected])) ok = NO;
+    NSString *loadedImage = providerImages[@"glGetString"];
     NSString *digest = hot ? rendererPath.stringByDeletingLastPathComponent.lastPathComponent.lowercaseString : @"bundled";
     return @{
         @"provenance_ok": @(ok),
         @"requested_library_path": rendererPath ?: @"<unset>",
         @"loaded_library_path": loadedImage ?: @"<unknown>",
         @"candidate_digest": digest ?: @"<unknown>",
-        @"symbol_images": images,
+        @"symbol_images": providerImages,
+        @"default_symbol_images": defaultImages,
+        @"default_symbol_images_match": @(defaultMatch),
     };
 }
 
