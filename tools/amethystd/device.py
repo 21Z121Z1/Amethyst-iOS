@@ -101,15 +101,23 @@ class DeviceController:
             )
         return result
 
-    def launch_app(self, bundle_id: str) -> CommandResult:
+    def launch_app(self, bundle_id: str, *, terminate_existing: bool = True) -> CommandResult:
+        """Launch Amethyst with a fresh host process by default.
+
+        A JVM is not treated as restartable inside an existing Amethyst process.
+        Device smoke/A-B runs therefore use CoreDevice's terminate-existing launch
+        transaction so every run gets a fresh native/JLI/JVM lifetime.  Callers
+        must opt out explicitly for non-game diagnostics.
+        """
         if not self.udid:
             raise ValueError("AMETHYST_DEVICE_UDID/--device is required for a state-changing run")
         if not shutil.which("xcrun"):
             raise RuntimeError("xcrun is unavailable; run the harness on macOS with Xcode command-line tools")
-        return self.runner.run(
-            ["xcrun", "devicectl", "device", "process", "launch", "--device", self.udid, bundle_id],
-            timeout=60,
-        )
+        argv = ["xcrun", "devicectl", "device", "process", "launch"]
+        if terminate_existing:
+            argv.append("--terminate-existing")
+        argv.extend(["--device", self.udid, bundle_id])
+        return self.runner.run(argv, timeout=60)
 
     def install_app(self, app_path: Path | str) -> CommandResult:
         if not self.udid:
