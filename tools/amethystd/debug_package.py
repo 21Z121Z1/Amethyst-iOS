@@ -4,6 +4,7 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import zipfile
@@ -17,7 +18,9 @@ MACHO_MAGICS = {
     b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
     b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
     b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
 }
+MH_EXECUTE = 0x2
 
 
 class AgentDebugBuildError(RuntimeError):
@@ -76,6 +79,73 @@ def is_macho(path: Path) -> bool:
             return handle.read(4) in MACHO_MAGICS
     except OSError:
         return False
+
+
+def _thin_macho_filetype(raw: bytes, offset: int = 0) -> int | None:
+    if len(raw) < offset + 16:
+        return None
+    magic = raw[offset : offset + 4]
+    if magic in {b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"}:
+        endian = "<"
+    elif magic in {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf"}:
+        endian = ">"
+    else:
+        return None
+    return struct.unpack_from(endian + "I", raw, offset + 12)[0]
+
+
+def macho_filetypes(path: Path) -> set[int] | None:
+    """Return Mach-O file types for all slices, or None for malformed input."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    thin = _thin_macho_filetype(raw)
+    if thin is not None:
+        return {thin}
+    if len(raw) < 8:
+        return None
+
+    magic = raw[:4]
+    if magic == b"\xca\xfe\xba\xbe":
+        endian, arch_size, is_64 = ">", 20, False
+    elif magic == b"\xbe\xba\xfe\xca":
+        endian, arch_size, is_64 = "<", 20, False
+    elif magic == b"\xca\xfe\xba\xbf":
+        endian, arch_size, is_64 = ">", 32, True
+    elif magic == b"\xbf\xba\xfe\xca":
+        endian, arch_size, is_64 = "<", 32, True
+    else:
+        return None
+
+    count = struct.unpack_from(endian + "I", raw, 4)[0]
+    if count <= 0 or count > 64 or len(raw) < 8 + count * arch_size:
+        return None
+    filetypes: set[int] = set()
+    for index in range(count):
+        base = 8 + index * arch_size
+        if is_64:
+            slice_offset, slice_size = struct.unpack_from(endian + "QQ", raw, base + 8)
+        else:
+            slice_offset, slice_size = struct.unpack_from(endian + "II", raw, base + 8)
+        if slice_size < 16 or slice_offset + 16 > len(raw):
+            return None
+        filetype = _thin_macho_filetype(raw, int(slice_offset))
+        if filetype is None:
+            return None
+        filetypes.add(filetype)
+    return filetypes
+
+
+def require_macho_executable(path: Path) -> None:
+    filetypes = macho_filetypes(path)
+    if not filetypes:
+        raise AgentDebugBuildError(f"native executable is missing, malformed, or not Mach-O: {path}")
+    if filetypes != {MH_EXECUTE}:
+        rendered = ", ".join(f"0x{value:x}" for value in sorted(filetypes))
+        raise AgentDebugBuildError(
+            f"AgentDebug main binary must be Mach-O MH_EXECUTE (0x2); observed file type(s): {rendered}"
+        )
 
 
 def profile_allows_bundle(profile: dict[str, Any], bundle_id: str) -> bool:
@@ -158,6 +228,7 @@ def build_native(repo_root: Path, *, jobs: int = 2) -> Path:
     ]
     for candidate in candidates:
         if candidate.is_file():
+            require_macho_executable(candidate)
             return candidate.resolve()
     raise AgentDebugBuildError("native build completed but AngelAuraAmethyst executable was not found")
 
@@ -234,8 +305,7 @@ def build_agent_debug_ipa(
     validate_profile(profile, bundle_id=bundle_id, device_udid=device_udid)
     signing_identity = discover_identity(identity)
     executable = native_binary.expanduser().resolve() if native_binary else build_native(repo_root, jobs=jobs)
-    if not executable.is_file() or not is_macho(executable):
-        raise AgentDebugBuildError(f"native executable is missing or not Mach-O: {executable}")
+    require_macho_executable(executable)
 
     with tempfile.TemporaryDirectory(prefix="amethyst-agentdebug-") as temp:
         root = Path(temp)

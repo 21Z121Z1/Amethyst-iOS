@@ -12,6 +12,9 @@ from uuid import uuid4
 
 _SAFE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _REMOTE_DOCUMENTS = "/Documents"
+_STREAM_PREFIXES = ("agent-events/", "agent-lab/")
+_STREAM_FILES = {"latestlog.txt"}
+_STREAM_CHUNK_BYTES = 256 * 1024
 
 
 def safe_component(value: str, label: str) -> str:
@@ -28,13 +31,22 @@ def documents_path(relative: str) -> str:
 
 
 class AgentContainerClient:
-    """Documents-relative Agent v2 transport using current pymobiledevice3 async House Arrest APIs."""
+    """Documents-relative Agent v2 transport using House Arrest/AFC.
+
+    Growing logs/events never use one unbounded `get_file_contents` response.
+    File size is checked first; unchanged files reuse the local copy, while a
+    changed file is transferred through bounded `fread` chunks. This keeps AFC
+    packet sizes deterministic and removes full-file transfers from no-change
+    polling iterations.
+    """
 
     def __init__(self, udid: str, bundle_id: str) -> None:
         if not udid:
             raise ValueError("device UDID is required")
         self.udid = udid
         self.bundle_id = bundle_id
+        self._stream_cache: dict[str, bytes] = {}
+        self._stream_sizes: dict[str, int] = {}
 
     @asynccontextmanager
     async def _afc(self) -> AsyncIterator[Any]:
@@ -54,7 +66,28 @@ class AgentContainerClient:
             ) as afc:
                 yield afc
 
-    async def read_optional(self, relative: str) -> bytes | None:
+    @staticmethod
+    def _is_stream_artifact(relative: str) -> bool:
+        return relative in _STREAM_FILES or relative.startswith(_STREAM_PREFIXES)
+
+    @staticmethod
+    async def _bounded_read(afc: Any, remote: str, size: int) -> bytes:
+        handle = await afc.fopen(remote, "r")
+        chunks: list[bytes] = []
+        remaining = size
+        try:
+            while remaining > 0:
+                requested = min(remaining, _STREAM_CHUNK_BYTES)
+                chunk = await afc.fread(handle, requested)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            await afc.fclose(handle)
+        return b"".join(chunks)
+
+    async def _read_direct_optional(self, relative: str) -> bytes | None:
         try:
             from pymobiledevice3.exceptions import AfcFileNotFoundError
         except ImportError as exc:
@@ -64,6 +97,52 @@ class AgentContainerClient:
                 return await afc.get_file_contents(documents_path(relative))
             except AfcFileNotFoundError:
                 return None
+
+    async def _read_stream_optional(self, relative: str) -> bytes | None:
+        try:
+            from pymobiledevice3.exceptions import AfcFileNotFoundError
+        except ImportError as exc:
+            raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
+        remote = documents_path(relative)
+        async with self._afc() as afc:
+            try:
+                info = await afc.stat(remote)
+            except AfcFileNotFoundError:
+                self._stream_cache.pop(relative, None)
+                self._stream_sizes.pop(relative, None)
+                return None
+            if info.get("st_ifmt") != "S_IFREG":
+                raise RuntimeError(f"device artifact is not a regular file: {relative}")
+            size = int(info["st_size"])
+            if self._stream_sizes.get(relative) == size and relative in self._stream_cache:
+                return self._stream_cache[relative]
+            data = await self._bounded_read(afc, remote, size)
+            self._stream_cache[relative] = data
+            self._stream_sizes[relative] = size
+            return data
+
+    async def read_tail(self, relative: str, *, max_bytes: int = 65536) -> dict[str, Any]:
+        """Return only a bounded tail to a Codex-facing log query."""
+        max_bytes = max(1024, min(int(max_bytes), 1024 * 1024))
+        data = await self.read_optional(relative)
+        if data is None:
+            return {"ok": True, "exists": False, "path": relative, "data": b""}
+        start = max(0, len(data) - max_bytes)
+        return {
+            "ok": True,
+            "exists": True,
+            "path": relative,
+            "size": len(data),
+            "offset": start,
+            "next_offset": len(data),
+            "eof": True,
+            "data": data[start:],
+        }
+
+    async def read_optional(self, relative: str) -> bytes | None:
+        if self._is_stream_artifact(relative):
+            return await self._read_stream_optional(relative)
+        return await self._read_direct_optional(relative)
 
     async def submit(self, request: dict[str, Any]) -> str:
         request_id = safe_component(str(request["request_id"]), "request_id")
@@ -83,7 +162,7 @@ class AgentContainerClient:
 
     async def response(self, request_id: str) -> dict[str, Any] | None:
         request_id = safe_component(request_id, "request_id")
-        raw = await self.read_optional(f"agent-responses/{request_id}.json")
+        raw = await self._read_direct_optional(f"agent-responses/{request_id}.json")
         if raw is None:
             return None
         value = json.loads(raw.decode("utf-8"))
@@ -120,11 +199,6 @@ class AgentContainerClient:
         return self._jsonl(await self.read_optional(f"agent-events/{run_id}.jsonl"))
 
     async def prepare_lab_run(self, run_id: str) -> None:
-        """Publish the active run without requiring an Objective-C -> Java bridge.
-
-        Test-only Java/Fabric instrumentation can read `${user.home}/agent-lab/current-run-id`,
-        then append its own events to `agent-lab/<run_id>.jsonl`.
-        """
         run_id = safe_component(run_id, "run_id")
         root = documents_path("agent-lab")
         temp = documents_path(f"agent-lab/.current-run-{uuid4().hex}.tmp")
@@ -167,12 +241,7 @@ class AgentContainerClient:
         deployment_digest = digest.hexdigest()
         stage_relative = f"agent-payloads/.staging/{deployment_digest}"
         stage_root = documents_path(stage_relative)
-        manifest = {
-            "version": 1,
-            "name": payload_name,
-            "digest": deployment_digest,
-            "files": manifest_files,
-        }
+        manifest = {"version": 1, "name": payload_name, "digest": deployment_digest, "files": manifest_files}
         async with self._afc() as afc:
             await afc.makedirs(stage_root)
             for local, entry in zip(files, manifest_files, strict=True):

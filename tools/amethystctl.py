@@ -9,18 +9,65 @@ import subprocess
 import sys
 from pathlib import Path
 from time import monotonic, sleep
+from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tools.amethystd.agent_output import bounded_result
 from tools.amethystd.debug_package import build_agent_debug_ipa
+from tools.amethystd.device import DeviceController
+from tools.amethystd.frame_metrics import analyze_png, compare_png_frames
+from tools.amethystd.preflight import collect_host_preflight
 from tools.amethystd.runtime_contract import verify_contract
 from tools.amethystd.server import request_daemon
 from tools.amethystd.store import StateStore
 
 
+_SPECIAL_GLFW_KEYS = {
+    "SPACE": 32,
+    "ESC": 256,
+    "ESCAPE": 256,
+    "ENTER": 257,
+    "TAB": 258,
+    "BACKSPACE": 259,
+    "INSERT": 260,
+    "DELETE": 261,
+    "RIGHT": 262,
+    "LEFT": 263,
+    "DOWN": 264,
+    "UP": 265,
+    "PAGE_UP": 266,
+    "PAGE_DOWN": 267,
+    "HOME": 268,
+    "END": 269,
+    "CAPS_LOCK": 280,
+}
+
+
+def glfw_key(value: str) -> int:
+    normalized = value.strip().upper().replace("-", "_")
+    if normalized in _SPECIAL_GLFW_KEYS:
+        return _SPECIAL_GLFW_KEYS[normalized]
+    if len(normalized) == 1 and (normalized.isalpha() or normalized.isdigit()):
+        return ord(normalized)
+    if normalized.startswith("F") and normalized[1:].isdigit():
+        number = int(normalized[1:])
+        if 1 <= number <= 25:
+            return 289 + number
+    try:
+        numeric = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"unknown GLFW key {value!r}") from exc
+    if not 0 <= numeric <= 512:
+        raise argparse.ArgumentTypeError("GLFW key must be in the range 0..512")
+    return numeric
+
+
 def emit(value: dict) -> int:
+    store = StateStore()
+    value = bounded_result(value, store.root)
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
     if value.get("ok"):
         return 0
@@ -87,10 +134,56 @@ def configure_local(store: StateStore, *, device_udid: str | None, bundle_id: st
     return {"ok": True, "configuration": store.load_config(), "daemon_reconfigure_pending": True}
 
 
+def frame_probe(store: StateStore, *, samples: int, interval: float) -> dict:
+    config = store.load_config()
+    udid = os.environ.get("AMETHYST_DEVICE_UDID") or config.get("device_udid")
+    if not udid:
+        return {"ok": False, "failure": "DEVICE_NOT_FOUND", "detail": "configure a device before frame probe"}
+    samples = max(1, min(int(samples), 8))
+    interval = max(0.0, min(float(interval), 5.0))
+    controller = DeviceController(udid)
+    run_id = f"frame-probe-{uuid4().hex[:12]}"
+    directory = store.artifact_dir(run_id)
+    paths: list[Path] = []
+    metrics: list[dict] = []
+    for index in range(samples):
+        path = directory / f"frame-{index:02d}.png"
+        shot = controller.screenshot(path)
+        if not shot.ok:
+            return {
+                "ok": False,
+                "failure": "DEVICE_DISCONNECTED",
+                "detail": "device screenshot failed",
+                "returncode": shot.returncode,
+                "stderr": shot.stderr[-4096:],
+                "artifact_dir": str(directory),
+            }
+        paths.append(path)
+        metrics.append(analyze_png(path))
+        if index + 1 < samples and interval:
+            sleep(interval)
+    comparisons = [compare_png_frames(paths[i], paths[i + 1]) for i in range(len(paths) - 1)]
+    hashes = {item.get("sha256") for item in metrics if item.get("sha256")}
+    return {
+        "ok": True,
+        "artifact_dir": str(directory),
+        "samples": metrics,
+        "comparisons": comparisons,
+        "all_samples_identical": len(hashes) == 1 if hashes else None,
+        "interpretation": "identical frames are evidence of a static presentation window, not by themselves proof of a renderer hang",
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="amethystctl")
+    root.add_argument(
+        "--max-output-bytes",
+        type=int,
+        help="Codex-facing stdout budget; oversized full JSON is stored under .amethyst-agent/tool-output",
+    )
     sub = root.add_subparsers(dest="command", required=True)
-    sub.add_parser("doctor")
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--host-only", action="store_true", help="check build/tool prerequisites without a device or daemon")
     sub.add_parser("status")
 
     configure = sub.add_parser("configure")
@@ -141,6 +234,30 @@ def parser() -> argparse.ArgumentParser:
     verify = runtime_sub.add_parser("verify")
     verify.add_argument("manifest")
 
+    logs = sub.add_parser("logs")
+    logs_sub = logs.add_subparsers(dest="logs_action", required=True)
+    query = logs_sub.add_parser("query", help="query only a bounded tail window instead of printing whole device logs")
+    query.add_argument("--source", choices=["latest", "app", "lab"], default="latest")
+    query.add_argument("--run-id")
+    query.add_argument("--contains")
+    query.add_argument("--limit", type=int, default=80)
+    query.add_argument("--max-bytes", type=int, default=65536)
+
+    input_parser = sub.add_parser("input")
+    input_sub = input_parser.add_subparsers(dest="input_action", required=True)
+    key = input_sub.add_parser("key", help="send a semantic GLFW key action")
+    key.add_argument("key", type=glfw_key, help="name such as W, ESCAPE, F3, or numeric GLFW key")
+    key.add_argument("--mode", choices=["tap", "press", "release"], default="tap")
+    key.add_argument("--hold-ms", type=int, default=50)
+    key.add_argument("--scancode", type=int, default=0)
+    key.add_argument("--mods", type=int, default=0)
+
+    frame = sub.add_parser("frame")
+    frame_sub = frame.add_subparsers(dest="frame_action", required=True)
+    probe = frame_sub.add_parser("probe", help="capture numerical framebuffer evidence for text-only agents")
+    probe.add_argument("--samples", type=int, default=2)
+    probe.add_argument("--interval", type=float, default=0.25)
+
     collect = sub.add_parser("collect")
     collect.add_argument("run_id")
     collect.add_argument("--crashes", action="store_true")
@@ -150,10 +267,16 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    if args.max_output_bytes is not None:
+        os.environ["AMETHYSTCTL_MAX_OUTPUT_BYTES"] = str(args.max_output_bytes)
     store = StateStore()
     try:
         if args.command == "runtime" and args.runtime_action == "verify":
             return emit(verify_contract(args.manifest))
+        if args.command == "doctor" and args.host_only:
+            return emit(collect_host_preflight(REPO_ROOT))
+        if args.command == "frame" and args.frame_action == "probe":
+            return emit(frame_probe(store, samples=args.samples, interval=args.interval))
 
         if args.command == "configure":
             if not args.device_udid and not args.bundle_id:
@@ -187,11 +310,7 @@ def main() -> int:
             ensure_daemon(store, start=True)
             asyncio.run(call("configure", {"device_udid": device_udid, "bundle_id": bundle_id}))
             deployment = asyncio.run(call("deploy", {"app_path": result["output"]}))
-            combined = {
-                "ok": bool(deployment.get("ok")),
-                "package": result,
-                "deploy": deployment,
-            }
+            combined = {"ok": bool(deployment.get("ok")), "package": result, "deploy": deployment}
             if not combined["ok"]:
                 combined["failure"] = deployment.get("failure", "INSTALL_UNKNOWN")
             return emit(combined)
@@ -208,7 +327,9 @@ def main() -> int:
 
         ensure_daemon(store, start=False)
         if args.command == "doctor":
-            return emit(asyncio.run(call("doctor")))
+            result = asyncio.run(call("doctor"))
+            result["host_preflight"] = collect_host_preflight(REPO_ROOT)
+            return emit(result)
         if args.command == "status":
             return emit(asyncio.run(call("status")))
         if args.command == "deploy":
@@ -216,34 +337,47 @@ def main() -> int:
         if args.command == "stop":
             return emit(asyncio.run(call("stop", {"force": args.force, "timeout": args.timeout})))
         if args.command == "run" and args.run_kind == "smoke":
-            return emit(
-                asyncio.run(
-                    call(
-                        "run_smoke",
-                        {
-                            "profile": args.profile,
-                            "target": args.target,
-                            "timeout": args.timeout,
-                            "require_dynamic_library_load": not args.no_dynamic_dylib,
-                        },
-                    )
-                )
-            )
+            return emit(asyncio.run(call("run_smoke", {
+                "profile": args.profile,
+                "target": args.target,
+                "timeout": args.timeout,
+                "require_dynamic_library_load": not args.no_dynamic_dylib,
+            })))
         if args.command == "payload" and args.payload_action == "stage":
             return emit(asyncio.run(call("stage_payload", {"local_path": args.path, "name": args.name})))
+        if args.command == "logs" and args.logs_action == "query":
+            return emit(asyncio.run(call("query_logs", {
+                "source": args.source,
+                "run_id": args.run_id,
+                "contains": args.contains,
+                "limit": args.limit,
+                "max_bytes": args.max_bytes,
+            })))
+        if args.command == "input" and args.input_action == "key":
+            common = {"key": args.key, "hold_ms": args.hold_ms, "scancode": args.scancode, "mods": args.mods}
+            if args.mode != "tap":
+                return emit(asyncio.run(call("input_key", {**common, "mode": args.mode})))
+            press = asyncio.run(call("input_key", {**common, "mode": "press"}))
+            if not press.get("ok"):
+                return emit({"ok": False, "phase": "press", "response": press})
+            hold_ms = max(1, min(int(args.hold_ms), 5000))
+            sleep(hold_ms / 1000.0)
+            release = asyncio.run(call("input_key", {**common, "mode": "release"}))
+            return emit({
+                "ok": bool(release.get("ok")),
+                "mode": "tap",
+                "key": args.key,
+                "hold_ms": hold_ms,
+                "press_state": press.get("state"),
+                "release_state": release.get("state"),
+                "response": release,
+            })
         if args.command == "collect":
-            return emit(
-                asyncio.run(
-                    call(
-                        "collect",
-                        {
-                            "run_id": args.run_id,
-                            "include_crashes": args.crashes,
-                            "screenshot": not args.no_screenshot,
-                        },
-                    )
-                )
-            )
+            return emit(asyncio.run(call("collect", {
+                "run_id": args.run_id,
+                "include_crashes": args.crashes,
+                "screenshot": not args.no_screenshot,
+            })))
         return emit({"ok": False, "error": "unsupported_command"})
     except Exception as exc:
         print(f"amethystctl: {type(exc).__name__}: {exc}", file=sys.stderr)
