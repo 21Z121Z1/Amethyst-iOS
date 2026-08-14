@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from tools.amethystd.container_io import AgentContainerClient, _is_transient_transport_error
 from tools.amethystd.device import CommandResult, DeviceController
@@ -94,7 +93,7 @@ class TransportRecoveryTests(unittest.TestCase):
         client._afc = flaky_afc  # type: ignore[method-assign]
         fake_errors = type("Errors", (), {"AfcFileNotFoundError": Missing})
         with patch.dict("sys.modules", {"pymobiledevice3.exceptions": fake_errors}):
-            with patch("tools.amethystd.container_io.asyncio.sleep", new_callable=unittest.mock.AsyncMock):
+            with patch("tools.amethystd.container_io.asyncio.sleep", new_callable=AsyncMock):
                 data = asyncio.run(client._read_direct_optional("latestlog.txt"))
         self.assertEqual(data, b"ok")
         self.assertEqual(attempts, 2)
