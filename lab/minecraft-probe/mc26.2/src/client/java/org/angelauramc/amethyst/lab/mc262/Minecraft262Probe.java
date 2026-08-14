@@ -36,6 +36,7 @@ public final class Minecraft262Probe implements ClientModInitializer {
 
     private final AtomicBoolean menuReady = new AtomicBoolean();
     private final AtomicBoolean rendererConsumerReady = new AtomicBoolean();
+    private final AtomicBoolean rendererConsumerFailed = new AtomicBoolean();
     private final AtomicBoolean playJoined = new AtomicBoolean();
     private final AtomicBoolean worldLoading = new AtomicBoolean();
     private final AtomicBoolean worldReady = new AtomicBoolean();
@@ -49,8 +50,11 @@ public final class Minecraft262Probe implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         emit("jvm_ready", Map.of("adapter", "mc26.2-fabric"));
-        emitRendererConsumerIdentity("client_initializer");
 
+        // Do not call GL.getFunctionProvider() from the initializer itself. That
+        // can initialize LWJGL earlier than Minecraft normally would and turn a
+        // provenance probe into a behavior-changing experiment. Observe it only
+        // after Minecraft reaches its normal client lifecycle/tick path.
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
             emit("minecraft_bootstrap", Map.of("minecraft_version", "26.2"));
             emitRendererConsumerIdentity("client_started");
@@ -108,7 +112,7 @@ public final class Minecraft262Probe implements ClientModInitializer {
     }
 
     private void emitRendererConsumerIdentity(String phase) {
-        if (rendererConsumerReady.get()) return;
+        if (rendererConsumerReady.get() || rendererConsumerFailed.get()) return;
         try {
             String requested = System.getProperty("org.lwjgl.opengl.libname", "");
             FunctionProvider provider = GL.getFunctionProvider();
@@ -139,7 +143,7 @@ public final class Minecraft262Probe implements ClientModInitializer {
 
             if (provenanceOk && rendererConsumerReady.compareAndSet(false, true)) {
                 emit("renderer_ready", fields);
-            } else if (hotRequested && !provenanceOk) {
+            } else if (hotRequested && rendererConsumerFailed.compareAndSet(false, true)) {
                 fields.put("failure_class", "HOT_PAYLOAD_PROVENANCE_MISMATCH");
                 fields.put("reason", "lwjgl_function_provider_does_not_match_requested_staged_image");
                 emit("failed", fields);
