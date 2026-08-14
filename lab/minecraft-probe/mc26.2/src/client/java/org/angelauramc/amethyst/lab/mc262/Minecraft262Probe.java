@@ -1,10 +1,14 @@
 package org.angelauramc.amethyst.lab.mc262;
 
 import java.io.IOException;
+import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
@@ -20,10 +24,18 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.Vec3;
 
 import org.angelauramc.amethyst.lab.LabEvents;
+import org.lwjgl.opengl.GL;
+import org.lwjgl.system.FunctionProvider;
+import org.lwjgl.system.SharedLibrary;
 
 /** Minecraft 26.2 semantic adapter. It emits facts only from authoritative Fabric/Minecraft hooks. */
 public final class Minecraft262Probe implements ClientModInitializer {
+    private static final Pattern HOT_STAGE = Pattern.compile(
+        "(?:^|/)agent-payloads/\\.staging/([0-9a-fA-F]{64})/(?:.*)$"
+    );
+
     private final AtomicBoolean menuReady = new AtomicBoolean();
+    private final AtomicBoolean rendererConsumerReady = new AtomicBoolean();
     private final AtomicBoolean playJoined = new AtomicBoolean();
     private final AtomicBoolean worldLoading = new AtomicBoolean();
     private final AtomicBoolean worldReady = new AtomicBoolean();
@@ -37,10 +49,12 @@ public final class Minecraft262Probe implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         emit("jvm_ready", Map.of("adapter", "mc26.2-fabric"));
+        emitRendererConsumerIdentity("client_initializer");
 
-        ClientLifecycleEvents.CLIENT_STARTED.register(client ->
-            emit("minecraft_bootstrap", Map.of("minecraft_version", "26.2"))
-        );
+        ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
+            emit("minecraft_bootstrap", Map.of("minecraft_version", "26.2"));
+            emitRendererConsumerIdentity("client_started");
+        });
 
         ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
             if (!(screen instanceof TitleScreen)) return;
@@ -93,7 +107,65 @@ public final class Minecraft262Probe implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(this::onEndClientTick);
     }
 
+    private void emitRendererConsumerIdentity(String phase) {
+        if (rendererConsumerReady.get()) return;
+        try {
+            String requested = System.getProperty("org.lwjgl.opengl.libname", "");
+            FunctionProvider provider = GL.getFunctionProvider();
+            if (provider == null) return;
+
+            long compileShader = provider.getFunctionAddress("glCompileShader");
+            long drawElements = provider.getFunctionAddress("glDrawElements");
+            String loaded = provider instanceof SharedLibrary sharedLibrary ? sharedLibrary.getPath() : null;
+            String canonicalRequested = canonicalPath(requested);
+            String canonicalLoaded = canonicalPath(loaded);
+            String requestedDigest = hotDigest(canonicalRequested);
+            String loadedDigest = hotDigest(canonicalLoaded);
+            boolean hotRequested = requestedDigest != null;
+            boolean pathMatches = canonicalRequested != null && canonicalRequested.equals(canonicalLoaded);
+            boolean addressesReady = compileShader != 0L && drawElements != 0L;
+            boolean provenanceOk = addressesReady && (!hotRequested || (pathMatches && requestedDigest.equals(loadedDigest)));
+
+            Map<String, Object> fields = new HashMap<>();
+            fields.put("proof", "lwjgl_gl_function_provider");
+            fields.put("phase", phase);
+            fields.put("provider_class", provider.getClass().getName());
+            fields.put("requested_library_path", canonicalRequested == null ? requested : canonicalRequested);
+            fields.put("loaded_library_path", canonicalLoaded == null ? (loaded == null ? "<unavailable>" : loaded) : canonicalLoaded);
+            fields.put("candidate_digest", hotRequested ? requestedDigest : "bundled");
+            fields.put("provenance_ok", provenanceOk);
+            fields.put("glCompileShader", Long.toUnsignedString(compileShader));
+            fields.put("glDrawElements", Long.toUnsignedString(drawElements));
+
+            if (provenanceOk && rendererConsumerReady.compareAndSet(false, true)) {
+                emit("renderer_ready", fields);
+            } else if (hotRequested && !provenanceOk) {
+                fields.put("failure_class", "HOT_PAYLOAD_PROVENANCE_MISMATCH");
+                fields.put("reason", "lwjgl_function_provider_does_not_match_requested_staged_image");
+                emit("failed", fields);
+            }
+        } catch (Throwable error) {
+            System.err.println("[AmethystLab] LWJGL consumer provenance unavailable at " + phase + ": " + error);
+        }
+    }
+
+    private static String canonicalPath(String value) {
+        if (value == null || value.isBlank() || !value.startsWith("/")) return value;
+        try {
+            return Path.of(value).toRealPath().toString();
+        } catch (IOException ignored) {
+            return Path.of(value).toAbsolutePath().normalize().toString();
+        }
+    }
+
+    private static String hotDigest(String path) {
+        if (path == null) return null;
+        Matcher matcher = HOT_STAGE.matcher(path);
+        return matcher.find() ? matcher.group(1).toLowerCase() : null;
+    }
+
     private void onEndClientTick(Minecraft client) {
+        emitRendererConsumerIdentity("client_tick");
         Entity playerEntity = client.player;
         Entity cameraEntity = client.getCameraEntity();
         boolean semanticWorld = playJoined.get()
