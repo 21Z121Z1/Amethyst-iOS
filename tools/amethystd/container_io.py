@@ -19,6 +19,22 @@ _STREAM_PREFIXES = ("agent-events/", "agent-lab/")
 _STREAM_FILES = {"latestlog.txt"}
 _STREAM_CHUNK_BYTES = 256 * 1024
 _DEVICE_CONNECTION_TYPES = frozenset({"USB", "Network"})
+_AFC_READ_ATTEMPTS = 3
+_AFC_RETRY_BASE_DELAY = 0.15
+_TRANSIENT_TRANSPORT_MARKERS = (
+    "separator is not found",
+    "ssl",
+    "record layer",
+    "baddev",
+    "device not found",
+    "devicenotfound",
+    "connection reset",
+    "connection aborted",
+    "connection closed",
+    "broken pipe",
+    "unexpected eof",
+    "usbmux",
+)
 _MACHO_MAGICS = {
     b"\xce\xfa\xed\xfe",
     b"\xcf\xfa\xed\xfe",
@@ -36,6 +52,20 @@ def _device_connection_type() -> str:
     if connection_type not in _DEVICE_CONNECTION_TYPES:
         raise ValueError("AMETHYST_DEVICE_CONNECTION_TYPE must be USB or Network")
     return connection_type
+
+
+def _is_transient_transport_error(error: BaseException) -> bool:
+    """Return True only for transport/session failures that are safe to retry on reads.
+
+    Network-paired iOS devices can transiently drop the House Arrest/AFC service
+    while the app and Minecraft process remain healthy.  Read-only operations
+    reopen the service and retry with bounded backoff; semantic/file-contract
+    errors are never hidden by this policy.
+    """
+    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+        return True
+    text = f"{type(error).__name__}: {error}".casefold()
+    return any(marker in text for marker in _TRANSIENT_TRANSPORT_MARKERS)
 
 
 def safe_component(value: str, label: str) -> str:
@@ -104,6 +134,10 @@ class AgentContainerClient:
     changed file is transferred through bounded `fread` chunks. This keeps AFC
     packet sizes deterministic and removes full-file transfers from no-change
     polling iterations.
+
+    Read-only AFC operations reopen the House Arrest service on a small set of
+    transient USB/network transport failures. State-changing writes remain
+    single-attempt because an interrupted write has an ambiguous commit point.
     """
 
     def __init__(self, udid: str, bundle_id: str) -> None:
@@ -132,6 +166,17 @@ class AgentContainerClient:
             ) as afc:
                 yield afc
 
+    async def _retry_read(self, operation: Any) -> Any:
+        """Retry an idempotent AFC read by reopening the service each attempt."""
+        for attempt in range(_AFC_READ_ATTEMPTS):
+            try:
+                return await operation()
+            except Exception as exc:
+                if not _is_transient_transport_error(exc) or attempt + 1 >= _AFC_READ_ATTEMPTS:
+                    raise
+                await asyncio.sleep(_AFC_RETRY_BASE_DELAY * (2**attempt))
+        raise AssertionError("unreachable AFC retry state")
+
     @staticmethod
     def _is_stream_artifact(relative: str) -> bool:
         return relative in _STREAM_FILES or relative.startswith(_STREAM_PREFIXES)
@@ -158,11 +203,15 @@ class AgentContainerClient:
             from pymobiledevice3.exceptions import AfcFileNotFoundError
         except ImportError as exc:
             raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
-        async with self._afc() as afc:
-            try:
-                return await afc.get_file_contents(documents_path(relative))
-            except AfcFileNotFoundError:
-                return None
+
+        async def read_once() -> bytes | None:
+            async with self._afc() as afc:
+                try:
+                    return await afc.get_file_contents(documents_path(relative))
+                except AfcFileNotFoundError:
+                    return None
+
+        return await self._retry_read(read_once)
 
     async def _read_stream_optional(self, relative: str) -> bytes | None:
         try:
@@ -170,22 +219,26 @@ class AgentContainerClient:
         except ImportError as exc:
             raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
         remote = documents_path(relative)
-        async with self._afc() as afc:
-            try:
-                info = await afc.stat(remote)
-            except AfcFileNotFoundError:
-                self._stream_cache.pop(relative, None)
-                self._stream_sizes.pop(relative, None)
-                return None
-            if info.get("st_ifmt") != "S_IFREG":
-                raise RuntimeError(f"device artifact is not a regular file: {relative}")
-            size = int(info["st_size"])
-            if self._stream_sizes.get(relative) == size and relative in self._stream_cache:
-                return self._stream_cache[relative]
-            data = await self._bounded_read(afc, remote, size)
-            self._stream_cache[relative] = data
-            self._stream_sizes[relative] = size
-            return data
+
+        async def read_once() -> bytes | None:
+            async with self._afc() as afc:
+                try:
+                    info = await afc.stat(remote)
+                except AfcFileNotFoundError:
+                    self._stream_cache.pop(relative, None)
+                    self._stream_sizes.pop(relative, None)
+                    return None
+                if info.get("st_ifmt") != "S_IFREG":
+                    raise RuntimeError(f"device artifact is not a regular file: {relative}")
+                size = int(info["st_size"])
+                if self._stream_sizes.get(relative) == size and relative in self._stream_cache:
+                    return self._stream_cache[relative]
+                data = await self._bounded_read(afc, remote, size)
+                self._stream_cache[relative] = data
+                self._stream_sizes[relative] = size
+                return data
+
+        return await self._retry_read(read_once)
 
     async def read_tail(self, relative: str, *, max_bytes: int = 65536) -> dict[str, Any]:
         """Return only a bounded tail to a Codex-facing log query."""
