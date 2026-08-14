@@ -67,7 +67,7 @@ The harness distinguishes request acceptance from observed state:
 
 ## Hot payload identity and provenance
 
-Renderer payloads are immutable content-addressed stages plus an active pointer. The host verifies transfer bytes, and the app re-verifies pointer/manifest/file size/SHA before use.
+Renderer payloads are immutable content-addressed stages plus an active pointer. The host verifies transfer bytes, rejects unsigned Mach-O payloads before transfer, and records code-signature metadata in the manifest. The app re-verifies pointer/manifest/file size/SHA before use.
 
 For a hot Mithril payload, Amethyst now resolves the staged absolute path **before** setting `org.lwjgl.opengl.libname`; LWJGL receives that absolute path rather than the bare bundled name. Before `renderer_ready`, native provenance resolves representative EGL/GL symbols with `dladdr` and requires them to come from the same expected staged Mach-O path. A mismatch fails closed as `HOT_PAYLOAD_PROVENANCE_MISMATCH` instead of permitting duplicate bundled/staged renderer images.
 

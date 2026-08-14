@@ -11,7 +11,12 @@ from pathlib import Path
 
 from tools.amethystctl import glfw_key
 from tools.amethystd.agent_output import bounded_result
-from tools.amethystd.container_io import AgentContainerClient, _STREAM_CHUNK_BYTES, _device_connection_type
+from tools.amethystd.container_io import (
+    AgentContainerClient,
+    _STREAM_CHUNK_BYTES,
+    _device_connection_type,
+    _macho_code_signature,
+)
 from tools.amethystd.device import CommandResult, DeviceController
 from tools.amethystd.debug_package import AgentDebugBuildError, MH_EXECUTE, macho_filetypes, require_macho_executable
 from tools.amethystd.frame_metrics import analyze_png, compare_png_frames
@@ -102,6 +107,49 @@ class ContainerStreamingTests(unittest.TestCase):
         self.assertEqual(len(data), size)
         self.assertEqual(afc.requests, [_STREAM_CHUNK_BYTES, _STREAM_CHUNK_BYTES, 123])
         self.assertTrue(afc.closed)
+
+
+class PayloadSignatureTests(unittest.TestCase):
+    def test_unsigned_macho_is_rejected_before_device_transfer(self) -> None:
+        from subprocess import CompletedProcess
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "libmithril.dylib"
+            path.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+            with patch("tools.amethystd.container_io.shutil.which", return_value="/usr/bin/codesign"):
+                with patch(
+                    "tools.amethystd.container_io.subprocess.run",
+                    return_value=CompletedProcess(
+                        ["codesign"], 1, stdout="", stderr="code object is not signed at all"
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "not validly code signed"):
+                        _macho_code_signature(path)
+
+    def test_signed_macho_manifest_metadata_is_read(self) -> None:
+        from subprocess import CompletedProcess
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "libmithril.dylib"
+            path.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+            responses = [
+                CompletedProcess(["codesign", "--verify"], 0, stdout="", stderr="valid on disk"),
+                CompletedProcess(
+                    ["codesign", "-dv"],
+                    0,
+                    stdout="",
+                    stderr="Identifier=libmithril\nTeamIdentifier=TEAM123\nCDHash=abc123\n",
+                ),
+            ]
+            with patch("tools.amethystd.container_io.shutil.which", return_value="/usr/bin/codesign"):
+                with patch("tools.amethystd.container_io.subprocess.run", side_effect=responses):
+                    metadata = _macho_code_signature(path)
+            self.assertEqual(metadata["verified"], True)
+            self.assertEqual(metadata["identifier"], "libmithril")
+            self.assertEqual(metadata["team_identifier"], "TEAM123")
+            self.assertEqual(metadata["cdhash"], "abc123")
 
 
 class DeviceTransportTests(unittest.TestCase):

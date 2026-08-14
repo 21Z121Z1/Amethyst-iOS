@@ -142,12 +142,15 @@ int pojavInitOpenGL() {
 
     void *rendererHandle = dlopen(rendererPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
     if (!rendererHandle) {
-        NSLog(@"EGLBridge: failed to preload renderer %@: %s", renderer, dlerror() ?: "unknown error");
+        const char *loadError = dlerror();
+        BOOL codeSignatureFailure = loadError && strstr(loadError, "code signature") != NULL;
+        NSLog(@"EGLBridge: failed to preload renderer %@: %s", renderer, loadError ?: "unknown error");
         AgentControlEmitActiveEvent(@"failed", @{
-            @"failure_class": @"NATIVE_DYLIB_LOAD_FAILURE",
-            @"reason": @"renderer_dlopen_failed",
+            @"failure_class": codeSignatureFailure ? @"DYLD_VALIDATION_FAILURE" : @"NATIVE_DYLIB_LOAD_FAILURE",
+            @"reason": codeSignatureFailure ? @"renderer_dlopen_code_signature_failed" : @"renderer_dlopen_failed",
             @"renderer": renderer ?: @"<unset>",
-            @"hot_payload": @([rendererPath hasPrefix:@"/"])
+            @"hot_payload": @([rendererPath hasPrefix:@"/"]),
+            @"dlerror": @(loadError ?: "unknown error")
         });
         return 1;
     }

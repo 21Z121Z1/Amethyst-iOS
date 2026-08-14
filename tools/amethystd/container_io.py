@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from time import monotonic
@@ -17,6 +19,16 @@ _STREAM_PREFIXES = ("agent-events/", "agent-lab/")
 _STREAM_FILES = {"latestlog.txt"}
 _STREAM_CHUNK_BYTES = 256 * 1024
 _DEVICE_CONNECTION_TYPES = frozenset({"USB", "Network"})
+_MACHO_MAGICS = {
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xca\xfe\xba\xbe",
+    b"\xca\xfe\xba\xbf",
+    b"\xbe\xba\xfe\xca",
+    b"\xbf\xba\xfe\xca",
+}
 
 
 def _device_connection_type() -> str:
@@ -37,6 +49,51 @@ def documents_path(relative: str) -> str:
     if path.is_absolute() or ".." in path.parts:
         raise ValueError(f"invalid Documents-relative path: {relative!r}")
     return str(PurePosixPath(_REMOTE_DOCUMENTS) / path)
+
+
+def _macho_code_signature(path: Path) -> dict[str, Any] | None:
+    """Require a valid host-side signature before staging executable payload bytes."""
+    with path.open("rb") as handle:
+        if handle.read(4) not in _MACHO_MAGICS:
+            return None
+
+    codesign = shutil.which("codesign")
+    if not codesign:
+        raise RuntimeError(f"Mach-O payload requires codesign before staging: {path}")
+
+    verification = subprocess.run(
+        [codesign, "--verify", "--strict", "--verbose=2", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    detail = "\n".join(part for part in (verification.stdout, verification.stderr) if part).strip()
+    if verification.returncode != 0:
+        raise RuntimeError(
+            f"Mach-O payload is not validly code signed: {path}; "
+            f"sign it with the AgentDebug development identity before staging; {detail or 'codesign verification failed'}"
+        )
+
+    display = subprocess.run(
+        [codesign, "-dv", "--verbose=4", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    metadata: dict[str, Any] = {"verified": True}
+    fields = {
+        "Identifier": "identifier",
+        "TeamIdentifier": "team_identifier",
+        "CDHash": "cdhash",
+        "Format": "format",
+        "Authority": "authority",
+    }
+    for line in f"{display.stdout}\n{display.stderr}".splitlines():
+        key, separator, value = line.partition("=")
+        output_key = fields.get(key)
+        if separator and output_key and value:
+            metadata[output_key] = value
+    return metadata
 
 
 class AgentContainerClient:
@@ -301,7 +358,11 @@ class AgentContainerClient:
                 raise ValueError("payload path escapes root")
             data = path.read_bytes()
             sha = hashlib.sha256(data).hexdigest()
-            manifest_files.append({"path": relative, "size": len(data), "sha256": sha})
+            entry: dict[str, Any] = {"path": relative, "size": len(data), "sha256": sha}
+            signature = _macho_code_signature(path)
+            if signature is not None:
+                entry["code_signature"] = signature
+            manifest_files.append(entry)
             digest.update(relative.encode())
             digest.update(b"\0")
             digest.update(bytes.fromhex(sha))
