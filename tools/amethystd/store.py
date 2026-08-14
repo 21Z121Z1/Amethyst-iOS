@@ -131,12 +131,25 @@ class StateStore:
 
     def retry_status(self, signature: str) -> dict[str, Any]:
         entry = self._retry_data()["attempts"].get(signature) or {}
+        failure = entry.get("failure")
+        if isinstance(failure, str) and not self.failure_affects_candidate_retry(failure):
+            # Backward-compatible migration: pre-v3.1-continuity files may have
+            # already accumulated two JIT/transport failures. They must not
+            # remain a permanent semantic experiment block after this upgrade.
+            return {
+                "blocked": False,
+                "consecutive_same_failure": 0,
+                "last_failure": failure,
+                "last_failure_fingerprint": entry.get("failure_fingerprint"),
+                "ignored_as_infrastructure": True,
+            }
         count = int(entry.get("consecutive_same_failure", 0))
         return {
             "blocked": count >= 2,
             "consecutive_same_failure": count,
-            "last_failure": entry.get("failure"),
+            "last_failure": failure,
             "last_failure_fingerprint": entry.get("failure_fingerprint"),
+            "ignored_as_infrastructure": False,
         }
 
     @staticmethod
