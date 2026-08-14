@@ -5,7 +5,7 @@
 ```text
 Codex / human operator
         |
-   amethystctl        stable JSON client
+ tools/amethystctl    stable wrapper + JSON CLI
         |
    amethystd          authoritative long-lived supervisor
         |
@@ -21,80 +21,84 @@ Codex / human operator
         |
       Minecraft
         |
-   test-only Fabric/Java lab probe
+ MC26.2 test-only Fabric semantic probe
 ```
 
 ### Codex
 
-Owns reasoning: choose the next goal, interpret evidence, patch code, compare baseline/candidate, and decide accept/reject. It must not become the device daemon.
+Owns reasoning: choose the next first failing invariant, patch one responsible layer, compare evidence, accept/reject, remove temporary diagnostics, commit/push an accepted change, and continue. It is not the device daemon and should not infer semantic state from screenshots/F3.
+
+### Stable host runtime
+
+`tools/bootstrap-agent` creates a supported Python 3.12/3.13 harness venv. `tools/amethystctl` is the stable executable entrypoint. Persistent state stays under `.amethyst-agent`, but the Unix socket uses a short hashed runtime directory under `/tmp`, so deep Codex worktree paths cannot exceed AF_UNIX path limits. Daemon health includes interpreter identity; a CLI/daemon Python mismatch is explicit and recoverable with `daemon restart`.
 
 ### `amethystd`
 
-Owns long-lived deterministic state: selected device/bundle, process generation, debugserver/JIT processor lifetime, request/response transport, run IDs, retries, classification, and artifacts. Its on-disk state is the host source of truth across individual `amethystctl` invocations.
-
-### `amethystctl`
-
-A small synchronous JSON CLI. Stdout is one JSON object suitable for an agent. Human diagnostics go to stderr. Routine automation should call it instead of composing raw `pymobiledevice3`, `devicectl`, PID, port, plist, or sleep commands.
-
-### pymobiledevice3 / CoreDevice
-
-The harness reuses current device services instead of reimplementing usbmux/AFC/House Arrest/DVT. Classic container transport uses House Arrest over USB. Developer services use the currently supported pymobiledevice3/CoreDevice path.
+Owns selected device/bundle, host and game-session generations, candidate identity, debugserver/JIT processor lifetime, request/response transport, retries, classification, and artifacts. Its on-disk state is the host source of truth across CLI calls, but device active-payload metadata is authoritative over stale host candidate cache.
 
 ### Amethyst Agent v2
 
-App-side domain semantics only: status, profile selection, launch/terminate, probes, process identity, append-only events, and idempotent responses. It does not try to grant itself JIT.
+Owns app-side domain semantics: status, profile selection, launch/terminate, process/game-session identity, input primitives, probes and append-only events. It does not grant itself JIT. Launch requests must carry the host-generated `game_session_generation`, which is echoed in responses/events and checked by the host.
 
-## Process generation
+## Two-level lifetime identity
 
-PID alone is not enough because stale observations can survive an app restart. Agent v2 exposes an opaque per-process `process_generation` value. When either PID or generation changes, host state invalidates:
+PID alone is insufficient, and one `process_generation` is still insufficient when the same Amethyst host process launches Minecraft more than once.
 
-- executable-JIT proof;
-- persistent debugger/Dyld-bypass proof;
-- JVM readiness;
-- renderer readiness;
-- Minecraft menu/world readiness.
+```text
+Amethyst host process_generation A
+  ├─ Minecraft game_session_generation 1
+  │    └─ JIT attach generation 1
+  └─ Minecraft game_session_generation 2
+       └─ JIT attach generation 2
+```
+
+A host identity change invalidates everything below it. A new/end game session invalidates JIT, Dyld, JVM, renderer, menu, world, chunk and benchmark proof even if PID/process generation are unchanged. UniversalJIT26 attach identity includes the game session, preventing stale debugserver/JIT proof from being reused across launches.
 
 ## Observed success
 
-The harness distinguishes request acceptance from observed state. Examples:
+The harness distinguishes request acceptance from observed state:
 
-- debugserver connected != UniversalJIT26 RX/RW mapping established;
-- file transfer returned != staged payload hash/manifest verified;
-- launch request accepted != JVM started;
-- app reports game surface running != Minecraft menu/world ready;
-- install command timed out != install failed.
+- debugserver connected != executable JIT mapping established;
+- staged SHA verified != Minecraft is calling that staged dylib;
+- launch accepted != JVM started;
+- `game_running` != Minecraft menu/world ready;
+- panorama/frame motion != GUI ready or world loaded;
+- install timeout != install failure.
 
-## File transport
+## Hot payload identity and provenance
 
-Agent v2 uses Documents-relative directories so it never persists container UUID paths:
+Renderer payloads are immutable content-addressed stages plus an active pointer. The host verifies transfer bytes, and the app re-verifies pointer/manifest/file size/SHA before use.
+
+For a hot Mithril payload, Amethyst now resolves the staged absolute path **before** setting `org.lwjgl.opengl.libname`; LWJGL receives that absolute path rather than the bare bundled name. Before `renderer_ready`, native provenance resolves representative EGL/GL symbols with `dladdr` and requires them to come from the same expected staged Mach-O path. A mismatch fails closed as `HOT_PAYLOAD_PROVENANCE_MISMATCH` instead of permitting duplicate bundled/staged renderer images.
+
+`payload clear` removes only the active pointer. Staging content remains for forensic comparison/re-activation and is never recursively deleted by that command.
+
+## File and event transport
+
+Agent v2 uses Documents-relative directories; host paths never persist an iOS container UUID:
 
 ```text
 agent-requests/
 agent-responses/
 agent-events/<run_id>.jsonl
 agent-processed/
+agent-lab/current-run-id
+agent-lab/current-session-id
 agent-lab/<run_id>.jsonl
-agent-payloads/.staging/
-agent-payloads/active/
+agent-payloads/.staging/<digest>/
+agent-payloads/active/<name>.json
 ```
 
-Host writes a request atomically (`.tmp` then rename). The app claims/processes it and writes an atomic response. Repeating a `request_id` returns/reuses the existing response rather than repeating a state-changing action.
+Requests/responses and active-pointer changes are atomic. Growing log/event files use bounded streaming reads. Every lab event includes both run and game-session identity; stale-session events cannot promote the current run.
 
-## UniversalJIT26 ownership
+## Minecraft semantic layer
 
-The repository contains both the app-side UniversalJIT26 consumer and the host-side RSP processor recovered from the successful physical-device debugging rollout. `amethystd` starts debugserver forwarding and attaches the processor **before** requesting Minecraft launch, then waits for the JIT breakpoints generated by `launchJVM`.
+The MC26.2 Fabric adapter builds as a real Java 25 CI target. It uses Fabric lifecycle/screen/play/chunk events to distinguish bootstrap, real TitleScreen readiness, play JOIN, player/camera world readiness and chunk stability. Screenshot/frame metrics remain useful graphics evidence but cannot synthesize semantic readiness.
 
-The processor's attach/handshake markers are not sufficient by themselves. Positive evidence is deliberately split across two observation planes:
+## Retry and causal experiment control
 
-- host: RSP processor attached, UniversalJIT26 commands handled, RX region prepared, keep-attached policy observed;
-- app: fresh `latestlog.txt` bytes show the RW/RX JIT mapping and, when required, both DyldLVBypass hook successes.
+Each smoke attempt is keyed by device-confirmed candidate digest + profile + target + dynamic-dylib requirement. Stable failure fingerprints normalize volatile PIDs/ports/addresses. After the same unchanged failure occurs twice, a third identical attempt is blocked as `RETRY_REQUIRES_CHANGED_EVIDENCE` unless Codex supplies an explicit diagnostic retry reason. Candidate changes, observed lifecycle recovery, or a named diagnostic deviation reset/justify the loop.
 
-Only when those agree for the same `process_generation` can `amethystd` promote to `JIT_RX_MAPPING_OK`/`DYLD_BYPASS_READY`. `AMETHYST_JIT_PROCESSOR` remains an optional development override; the bundled implementation is the default.
+## Artifacts
 
-## Hot experiment payloads
-
-The low-frequency AgentDebug base app contains the stable launcher/JIT/control foundation. High-frequency renderer/mod/config experiments are staged into Documents, verified by manifest/hash, then activated through a small pointer. This avoids treating a full hundreds-of-megabytes IPA reinstall as the normal renderer iteration path.
-
-## Benchmark layer
-
-The test-only Java lab writer establishes a run-scoped event protocol (`menu_ready`, `world_ready`, `chunks_stable`, warmup/measurement boundaries). A version-specific Fabric/Minecraft adapter must emit those events only from authoritative lifecycle hooks. Device-side DVT/sysmon and optional Instruments traces complement, rather than replace, in-game frame-time evidence.
+Every physical run collects run-scoped state/events/logs and failure evidence. CI separately uploads host contract/provenance data, the built MC26.2 probe, and native build metadata/binary. CI proves that the harness and native control plane compile and satisfy their contracts; only a fresh physical-iPad run can prove real device JIT, GUI/world correctness and performance.

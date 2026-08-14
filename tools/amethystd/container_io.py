@@ -198,27 +198,85 @@ class AgentContainerClient:
         run_id = safe_component(run_id, "run_id")
         return self._jsonl(await self.read_optional(f"agent-events/{run_id}.jsonl"))
 
-    async def prepare_lab_run(self, run_id: str) -> None:
+    async def prepare_lab_run(self, run_id: str, game_session_generation: str) -> None:
         run_id = safe_component(run_id, "run_id")
+        game_session_generation = safe_component(game_session_generation, "game_session_generation")
         root = documents_path("agent-lab")
-        temp = documents_path(f"agent-lab/.current-run-{uuid4().hex}.tmp")
-        final = documents_path("agent-lab/current-run-id")
         async with self._afc() as afc:
             await afc.makedirs(root)
-            await afc.set_file_contents(temp, (run_id + "\n").encode())
-            try:
-                await afc.rm(final)
-            except Exception:
-                pass
-            await afc.rename(temp, final)
+            for filename, value in (("current-run-id", run_id), ("current-session-id", game_session_generation)):
+                temp = documents_path(f"agent-lab/.{filename}-{uuid4().hex}.tmp")
+                final = documents_path(f"agent-lab/{filename}")
+                await afc.set_file_contents(temp, (value + "\n").encode())
+                try:
+                    await afc.rm(final)
+                except Exception:
+                    pass
+                await afc.rename(temp, final)
 
-    async def read_lab_events(self, run_id: str) -> list[dict[str, Any]]:
+    async def read_lab_events(self, run_id: str, game_session_generation: str | None = None) -> list[dict[str, Any]]:
         run_id = safe_component(run_id, "run_id")
+        if game_session_generation is not None:
+            game_session_generation = safe_component(game_session_generation, "game_session_generation")
         events = self._jsonl(await self.read_optional(f"agent-lab/{run_id}.jsonl"))
         for event in events:
             if event.get("run_id") != run_id:
                 raise RuntimeError("lab event/run_id mismatch")
+            if game_session_generation is not None and event.get("game_session_generation") != game_session_generation:
+                raise RuntimeError("lab event/game_session_generation mismatch")
         return events
+
+    async def inspect_payload(self, payload_name: str) -> dict[str, Any]:
+        payload_name = safe_component(payload_name, "payload_name")
+        pointer_raw = await self._read_direct_optional(f"agent-payloads/active/{payload_name}.json")
+        if pointer_raw is None:
+            return {"ok": True, "name": payload_name, "active": False}
+        pointer = json.loads(pointer_raw.decode("utf-8"))
+        if not isinstance(pointer, dict) or pointer.get("name") != payload_name:
+            raise RuntimeError("active payload pointer failed identity validation")
+        stage = pointer.get("stage")
+        digest = pointer.get("digest")
+        if not isinstance(stage, str) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            raise RuntimeError("active payload pointer is incomplete or has an invalid digest")
+        digest = digest.lower()
+        expected_stage = f"agent-payloads/.staging/{digest}"
+        if stage.lower() != expected_stage:
+            raise RuntimeError("active payload pointer stage/digest mismatch")
+        manifest_raw = await self._read_direct_optional(f"{expected_stage}/manifest.json")
+        manifest = json.loads(manifest_raw.decode("utf-8")) if manifest_raw is not None else None
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("version") != 1
+            or manifest.get("name") != payload_name
+            or str(manifest.get("digest", "")).lower() != digest
+            or not isinstance(manifest.get("files"), list)
+        ):
+            raise RuntimeError("active payload manifest failed identity validation")
+        pointer = {**pointer, "digest": digest, "stage": expected_stage}
+        return {"ok": True, "name": payload_name, "active": True, "pointer": pointer, "manifest": manifest}
+
+    async def clear_payload(self, payload_name: str) -> dict[str, Any]:
+        payload_name = safe_component(payload_name, "payload_name")
+        try:
+            from pymobiledevice3.exceptions import AfcFileNotFoundError
+        except ImportError as exc:
+            raise RuntimeError("pymobiledevice3 Python package is required by amethystd") from exc
+        before = await self.inspect_payload(payload_name)
+        final = documents_path(f"agent-payloads/active/{payload_name}.json")
+        async with self._afc() as afc:
+            try:
+                await afc.rm(final)
+                cleared = True
+            except AfcFileNotFoundError:
+                cleared = False
+        return {
+            "ok": True,
+            "name": payload_name,
+            "active": False,
+            "cleared": cleared,
+            "previous": before if before.get("active") else None,
+            "staging_preserved": True,
+        }
 
     async def stage_payload(self, local_path: Path | str, payload_name: str) -> dict[str, Any]:
         payload_name = safe_component(payload_name, "payload_name")

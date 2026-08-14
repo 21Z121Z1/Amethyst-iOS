@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+VENV=${AMETHYST_AGENT_VENV:-"$ROOT/.amethyst-agent/venv"}
+if [ -n "${AMETHYST_AGENT_BOOTSTRAP_PYTHON:-}" ]; then
+  PYTHON=$AMETHYST_AGENT_BOOTSTRAP_PYTHON
+else
+  PYTHON=""
+  for candidate in python3.13 python3.12; do
+    if command -v "$candidate" >/dev/null 2>&1; then PYTHON=$(command -v "$candidate"); break; fi
+  done
+fi
+if [ -z "$PYTHON" ]; then
+  echo "bootstrap-agent: CPython 3.12 or 3.13 is required" >&2
+  exit 2
+fi
+"$PYTHON" -c 'import sys; assert (3,12) <= sys.version_info[:2] < (3,14), f"unsupported Python {sys.version.split()[0]}; expected >=3.12,<3.14"'
+if [ ! -x "$VENV/bin/python" ]; then
+  "$PYTHON" -m venv "$VENV"
+fi
+"$VENV/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/requirements-agent.txt"
+AMETHYST_AGENT_PYTHON="$VENV/bin/python" "$ROOT/tools/amethystctl" doctor --host-only
+printf '\nHarness ready. Use: %s/tools/amethystctl <command>\n' "$ROOT"

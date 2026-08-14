@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -86,7 +87,7 @@ class ContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
             os.environ.pop("AMETHYST_JIT_PROCESSOR", None)
             session = JITSession(DeviceController("fake-udid"), Path(tmp))
-            command = session._processor_command(12345, 42, "run-1", "gen-1")
+            command = session._processor_command(12345, 42, "run-1", "gen-1", "session-1")
             self.assertTrue(any(part.endswith("universal_jit26_processor.py") for part in command))
             self.assertIn("12345", command)
             self.assertIn("42", command)
@@ -141,6 +142,113 @@ class ContractTests(unittest.TestCase):
             with ZipFile(jar, "a") as archive:
                 archive.writestr("example/Agent$1.class", b"inner")
             self.assertTrue(verify_contract(manifest)["ok"])
+
+
+class SessionGenerationTests(unittest.TestCase):
+    def test_new_game_session_invalidates_jit_and_semantic_evidence_without_host_restart(self) -> None:
+        state = RunState(run_id="run-session", bundle_id="test")
+        state.observe_process(10, "host-a")
+        state.begin_game_session("session-a")
+        state.transition(Stage.WORLD_READY)
+        state.mark_jit(
+            exec_ready=True,
+            dynamic_library_load_ready=True,
+            evidence={"renderer_ready": True, "world_ready": True, "menu_ready": True},
+        )
+        state.begin_game_session("session-b")
+        self.assertEqual(state.pid, 10)
+        self.assertEqual(state.process_generation, "host-a")
+        self.assertEqual(state.game_session_generation, "session-b")
+        self.assertFalse(state.jit_exec_ready)
+        self.assertFalse(state.dynamic_library_load_ready)
+        self.assertNotIn("renderer_ready", state.evidence)
+        self.assertNotIn("world_ready", state.evidence)
+        self.assertNotIn("menu_ready", state.evidence)
+
+    def test_end_game_session_invalidates_session_scoped_proof(self) -> None:
+        state = RunState(run_id="run-stop", bundle_id="test")
+        state.observe_process(10, "host-a")
+        state.begin_game_session("session-a")
+        state.transition(Stage.WORLD_READY, world_ready=True)
+        state.end_game_session()
+        self.assertIsNone(state.game_session_generation)
+        self.assertEqual(state.stage, Stage.AGENT_READY)
+        self.assertNotIn("world_ready", state.evidence)
+
+
+class RetryGuardTests(unittest.TestCase):
+    def test_identical_failure_is_blocked_after_two_occurrences_and_reset_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp)
+            signature = store.attempt_signature(
+                candidate_digest="abc",
+                profile="DirectVulkan",
+                target="WORLD_READY",
+                require_dynamic_library_load=True,
+            )
+            self.assertFalse(store.retry_status(signature)["blocked"])
+            store.record_failure(signature, failure="MC_READY_TIMEOUT", fingerprint="same")
+            self.assertFalse(store.retry_status(signature)["blocked"])
+            store.record_failure(signature, failure="MC_READY_TIMEOUT", fingerprint="same")
+            self.assertTrue(store.retry_status(signature)["blocked"])
+            store.reset_retry_guard("observed launcher recovery")
+            self.assertFalse(store.retry_status(signature)["blocked"])
+
+    def test_candidate_change_changes_attempt_signature(self) -> None:
+        one = StateStore.attempt_signature(
+            candidate_digest="aaa", profile="DirectVulkan", target="WORLD_READY", require_dynamic_library_load=True
+        )
+        two = StateStore.attempt_signature(
+            candidate_digest="bbb", profile="DirectVulkan", target="WORLD_READY", require_dynamic_library_load=True
+        )
+        self.assertNotEqual(one, two)
+
+
+class RuntimePathTests(unittest.TestCase):
+    def test_socket_path_stays_short_when_persistent_root_is_long(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            long_root = Path(tmp) / ("very-long-component-" * 8)
+            store = StateStore(long_root)
+            self.assertNotEqual(store.socket_path.parent, store.root)
+            self.assertLess(len(str(store.socket_path).encode()), 100)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(store.socket_path))
+            store.socket_path.unlink(missing_ok=True)
+
+
+class CandidateStoreTests(unittest.TestCase):
+    def test_candidate_manifest_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp)
+            value = {"name": "mithril", "active": True, "digest": "abc", "files": []}
+            store.save_candidate("mithril", value)
+            self.assertEqual(store.load_candidate("mithril"), value)
+            with self.assertRaises(ValueError):
+                store.save_candidate("../escape", value)
+
+class SupervisorPreDeviceTests(unittest.TestCase):
+    def test_smoke_reaches_structured_device_preflight_without_stale_retry_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = Supervisor(StateStore(tmp), device_udid="fake", bundle_id="test")
+            doctor = {
+                "device": {
+                    "pymobiledevice3": {"available": False, "python_api_available": False, "ok": False},
+                    "devicectl": {"available": False},
+                }
+            }
+            with patch.object(supervisor, "doctor", return_value=doctor):
+                result = asyncio.run(supervisor.run_smoke(profile="DirectVulkan", target="MENU_READY"))
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["state"]["failure"], FailureClass.DEVICE_NOT_FOUND.value)
+            self.assertIn("host_retry_status", result["state"]["evidence"])
+
+    def test_repeat_override_requires_reason_and_flag_together(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = Supervisor(StateStore(tmp), device_udid="fake", bundle_id="test")
+            with self.assertRaises(ValueError):
+                asyncio.run(supervisor.run_smoke(profile="DirectVulkan", allow_repeat_failure=True))
+            with self.assertRaises(ValueError):
+                asyncio.run(supervisor.run_smoke(profile="DirectVulkan", retry_reason="diagnostic"))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 
 #include "EGL/egl.h"
@@ -22,6 +23,43 @@
 #include "utils.h"
 
 int clientAPI;
+
+static NSString *RendererCanonicalPath(NSString *path) {
+    if (!path.length) return nil;
+    return [[[NSURL fileURLWithPath:path] URLByResolvingSymlinksInPath].path stringByStandardizingPath];
+}
+
+static NSString *RendererImagePath(void *address) {
+    if (!address) return nil;
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr(address, &info) == 0 || !info.dli_fname) return nil;
+    return RendererCanonicalPath(@(info.dli_fname));
+}
+
+static NSDictionary *RendererProvenance(void *rendererHandle, NSString *rendererPath) {
+    BOOL hot = [rendererPath hasPrefix:@"/"];
+    NSString *expected = hot ? RendererCanonicalPath(rendererPath) : nil;
+    NSArray<NSString *> *symbols = @[ @"eglGetProcAddress", @"eglMakeCurrent", @"glGetString", @"glGetIntegerv", @"glDrawElements" ];
+    NSMutableDictionary *images = [NSMutableDictionary dictionary];
+    BOOL ok = YES;
+    for (NSString *symbol in symbols) {
+        void *address = dlsym(RTLD_DEFAULT, symbol.UTF8String);
+        NSString *image = RendererImagePath(address);
+        images[symbol] = image ?: @"<missing>";
+        if (hot && (!image || ![image isEqualToString:expected])) ok = NO;
+    }
+    NSString *loadedImage = RendererImagePath(dlsym(rendererHandle, "glGetString"));
+    if (hot && (!loadedImage || ![loadedImage isEqualToString:expected])) ok = NO;
+    NSString *digest = hot ? rendererPath.stringByDeletingLastPathComponent.lastPathComponent.lowercaseString : @"bundled";
+    return @{
+        @"provenance_ok": @(ok),
+        @"requested_library_path": rendererPath ?: @"<unset>",
+        @"loaded_library_path": loadedImage ?: @"<unknown>",
+        @"candidate_digest": digest ?: @"<unknown>",
+        @"symbol_images": images,
+    };
+}
 
 void JNI_LWJGL_changeRenderer(const char* value_c) {
     JNIEnv *env;
@@ -84,7 +122,6 @@ int pojavInitOpenGL() {
         return 1;
     }
 
-    JNI_LWJGL_changeRenderer(renderer.UTF8String);
     NSError *payloadError = nil;
     NSString *payloadName = [renderer isEqualToString:@ RENDERER_NAME_MITHRIL] ? @"mithril" : nil;
     NSString *rendererPath = AgentPayloadLibraryPath(renderer, payloadName, &payloadError);
@@ -98,6 +135,11 @@ int pojavInitOpenGL() {
         return 1;
     }
 
+    // A hot payload must be the same image LWJGL opens. Passing only the basename
+    // can load the bundled Frameworks copy and create two independent GL states.
+    NSString *lwjglLibrary = [rendererPath hasPrefix:@"/"] ? rendererPath : renderer;
+    JNI_LWJGL_changeRenderer(lwjglLibrary.UTF8String);
+
     void *rendererHandle = dlopen(rendererPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
     if (!rendererHandle) {
         NSLog(@"EGLBridge: failed to preload renderer %@: %s", renderer, dlerror() ?: "unknown error");
@@ -107,6 +149,19 @@ int pojavInitOpenGL() {
             @"renderer": renderer ?: @"<unset>",
             @"hot_payload": @([rendererPath hasPrefix:@"/"])
         });
+        return 1;
+    }
+
+    NSDictionary *provenance = RendererProvenance(rendererHandle, rendererPath);
+    if ([rendererPath hasPrefix:@"/"] && ![provenance[@"provenance_ok"] boolValue]) {
+        NSLog(@"EGLBridge: hot payload provenance mismatch: %@", provenance);
+        NSMutableDictionary *failure = [provenance mutableCopy];
+        failure[@"failure_class"] = @"HOT_PAYLOAD_PROVENANCE_MISMATCH";
+        failure[@"reason"] = @"renderer_symbols_resolved_to_different_image";
+        failure[@"renderer"] = renderer ?: @"<unset>";
+        failure[@"hot_payload"] = @YES;
+        AgentControlEmitActiveEvent(@"failed", failure);
+        dlclose(rendererHandle);
         return 1;
     }
 
@@ -120,10 +175,10 @@ int pojavInitOpenGL() {
         return 1;
     }
 
-    AgentControlEmitActiveEvent(@"renderer_ready", @{
-        @"renderer": renderer ?: @"<unset>",
-        @"hot_payload": @([rendererPath hasPrefix:@"/"])
-    });
+    NSMutableDictionary *ready = [provenance mutableCopy];
+    ready[@"renderer"] = renderer ?: @"<unset>";
+    ready[@"hot_payload"] = @([rendererPath hasPrefix:@"/"]);
+    AgentControlEmitActiveEvent(@"renderer_ready", ready);
     return 0;
 }
 

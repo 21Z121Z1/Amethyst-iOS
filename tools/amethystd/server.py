@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -95,7 +96,9 @@ class AgentServer:
             )
             if probe.get("ok") and probe.get("state") == "launcher":
                 self.supervisor._observe_identity(state, probe)
+                state.end_game_session()
                 self.store.save(state)
+                self.store.reset_retry_guard("observed return to launcher")
                 self.supervisor.close()
                 return {"ok": True, "accepted": True, "observed": True, "response": probe}
             await asyncio.sleep(0.25)
@@ -193,7 +196,14 @@ class AgentServer:
         method = request.get("method")
         params = request.get("params") or {}
         if method == "ping":
-            return {"ok": True, "daemon": "amethystd"}
+            return {
+                "ok": True,
+                "daemon": "amethystd",
+                "pid": os.getpid(),
+                "python_executable": sys.executable,
+                "python_version": sys.version.split()[0],
+                "socket": str(self.store.socket_path),
+            }
         if method == "configure":
             return self._configure(**params)
         if method == "doctor":
@@ -222,6 +232,10 @@ class AgentServer:
             return result
         if method == "stage_payload":
             return await self.supervisor.stage_payload(**params)
+        if method == "inspect_payload":
+            return await self.supervisor.inspect_payload(**params)
+        if method == "clear_payload":
+            return await self.supervisor.clear_payload(**params)
         if method == "collect":
             return await self.supervisor.collect(**params)
         if method == "query_logs":

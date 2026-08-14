@@ -4,9 +4,11 @@ import asyncio
 import json
 import os
 import plistlib
+import re
+import sys
 import zipfile
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Any
 from uuid import uuid4
 
@@ -26,6 +28,7 @@ EVENT_TO_STAGE = {
     "menu_ready": Stage.MENU_READY,
     "world_loading": Stage.WORLD_LOADING,
     "world_ready": Stage.WORLD_READY,
+    "chunks_stable": Stage.CHUNKS_STABLE,
     "benchmark_warmup_started": Stage.WARMUP,
     "benchmark_started": Stage.MEASURING,
 }
@@ -58,14 +61,23 @@ class Supervisor:
         device = self.device.doctor()
         pmd3 = device["pymobiledevice3"]
         bundled_processor = Path(__file__).with_name("universal_jit26_processor.py")
+        python_supported = (3, 12) <= sys.version_info[:2] < (3, 14)
         return {
             "ok": bool(
-                pmd3["available"]
+                python_supported
+                and pmd3["available"]
                 and pmd3["python_api_available"]
                 and device["devicectl"]["available"]
                 and pmd3.get("ok", False)
             ),
             "bundle_id": self.bundle_id,
+            "python": {
+                "executable": sys.executable,
+                "version": sys.version.split()[0],
+                "supported": python_supported,
+                "supported_range": ">=3.12,<3.14",
+            },
+            "daemon_runtime": {"root": str(self.store.runtime_root), "socket": str(self.store.socket_path)},
             "device": device,
             "jit_processor": {
                 "available": bundled_processor.is_file() or bool(os.environ.get("AMETHYST_JIT_PROCESSOR")),
@@ -79,14 +91,28 @@ class Supervisor:
         state = self.store.load()
         return {"ok": True, "state": state.to_dict() if state else None}
 
-    def _new_state(self, run_id: str | None = None) -> RunState:
+    def _new_state(
+        self,
+        run_id: str | None = None,
+        *,
+        candidate: dict[str, Any] | None = None,
+        attempt_signature: str | None = None,
+    ) -> RunState:
         state = RunState(
             run_id=run_id or f"run-{uuid4().hex[:16]}",
             bundle_id=self.bundle_id,
             device_udid=self.device_udid,
+            candidate=candidate or {},
+            attempt_signature=attempt_signature,
         )
         self.store.save(state)
-        self.store.append_event(state.run_id, "run_created", bundle_id=self.bundle_id)
+        self.store.append_event(
+            state.run_id,
+            "run_created",
+            bundle_id=self.bundle_id,
+            candidate=state.candidate,
+            attempt_signature=attempt_signature,
+        )
         return state
 
     async def _agent_request(
@@ -97,6 +123,7 @@ class Supervisor:
         params: dict[str, Any] | None = None,
         *,
         guard_generation: bool = True,
+        guard_session: bool = True,
         timeout: float = 20,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
@@ -108,6 +135,8 @@ class Supervisor:
         }
         if guard_generation and state.process_generation:
             request["if_process_generation"] = state.process_generation
+        if guard_session and state.game_session_generation:
+            request["if_game_session_generation"] = state.game_session_generation
         self.store.append_event(state.run_id, "request_submitted", action=action, request_id=request["request_id"])
         response = await client.request(request, timeout=timeout)
         self.store.append_event(
@@ -126,7 +155,14 @@ class Supervisor:
         generation = response.get("process_generation")
         if not isinstance(pid, int) or not isinstance(generation, str) or not generation:
             raise RuntimeError("Agent v2 response did not provide process_id/process_generation")
-        return state.observe_process(pid, generation)
+        changed = state.observe_process(pid, generation)
+        if state.game_session_generation:
+            observed_session = response.get("game_session_generation")
+            if observed_session != state.game_session_generation:
+                raise RuntimeError(
+                    f"Agent game session mismatch: expected {state.game_session_generation}, observed {observed_session!r}"
+                )
+        return changed
 
     @staticmethod
     def event_key(event: dict[str, Any]) -> tuple[str, str] | tuple[str, str, int] | None:
@@ -288,8 +324,33 @@ class Supervisor:
         timeout: float = 180,
         require_dynamic_library_load: bool = True,
         run_id: str | None = None,
+        candidate_name: str = "mithril",
+        allow_repeat_failure: bool = False,
+        retry_reason: str | None = None,
     ) -> dict[str, Any]:
-        state = self._new_state(run_id)
+        wanted = Stage(target.upper())
+        if bool(allow_repeat_failure) != bool(retry_reason):
+            raise ValueError("--allow-repeat-failure and --retry-reason must be supplied together so the diagnostic deviation is auditable")
+        candidate = self.store.load_candidate(candidate_name) or {
+            "name": candidate_name,
+            "active": False,
+            "digest": "bundled",
+            "source": "bundled_or_untracked",
+        }
+        candidate_digest = str(candidate.get("digest") or "bundled")
+        signature = self.store.attempt_signature(
+            candidate_digest=candidate_digest,
+            profile=profile,
+            target=wanted.value,
+            require_dynamic_library_load=require_dynamic_library_load,
+        )
+        if retry_reason:
+            self.store.reset_retry_guard(f"explicit retry: {retry_reason}")
+        state = self._new_state(run_id, candidate=candidate, attempt_signature=signature)
+        # Device-side active payload is authoritative. Do not reject here from
+        # potentially stale host candidate metadata; reconcile after Agent v2
+        # is reachable, then apply the retry guard before profile/JIT work.
+        state.evidence["host_retry_status"] = self.store.retry_status(signature)
         try:
             doctor = self.doctor()
             pmd3 = doctor["device"]["pymobiledevice3"]
@@ -299,7 +360,7 @@ class Supervisor:
             if not pmd3["python_api_available"]:
                 state.fail(
                     FailureClass.AGENT_UNREACHABLE,
-                    "amethystd Python environment lacks pymobiledevice3; install requirements-agent.txt in the daemon environment",
+                    "amethystd Python environment lacks pymobiledevice3; run tools/bootstrap-agent and use tools/amethystctl",
                     blocked=True,
                 )
                 return self._finish(state)
@@ -309,7 +370,11 @@ class Supervisor:
             if not self.device_udid:
                 state.fail(FailureClass.DEVICE_NOT_FOUND, "explicit device UDID is required for unattended state changes", blocked=True)
                 return self._finish(state)
-            state.transition(Stage.DEVICE_PREFLIGHT_OK, doctor=doctor)
+            state.transition(
+                Stage.DEVICE_PREFLIGHT_OK,
+                doctor=doctor,
+                host_retry_status=state.evidence.get("host_retry_status"),
+            )
             self.store.save(state)
 
             launch_app = await asyncio.to_thread(self.device.launch_app, self.bundle_id)
@@ -328,7 +393,7 @@ class Supervisor:
             self.store.save(state)
 
             client = AgentContainerClient(self.device_udid, self.bundle_id)
-            status = await self._agent_request(client, state, "status", guard_generation=False, timeout=30)
+            status = await self._agent_request(client, state, "status", guard_generation=False, guard_session=False, timeout=30)
             if not status.get("ok"):
                 state.fail(FailureClass.AGENT_UNREACHABLE, json.dumps(status, sort_keys=True))
                 return self._finish(state)
@@ -336,9 +401,61 @@ class Supervisor:
             state.app_state = status.get("state")
             state.profile = status.get("profile") or {}
             state.transition(Stage.AGENT_READY, process_invalidated=invalidated)
+
+            # Reconcile the candidate against the device before any expensive JIT/game work.
+            # The device's active pointer is authoritative when a prior tool or run changed it.
+            device_candidate = await client.inspect_payload(candidate_name)
+            if device_candidate.get("active"):
+                manifest = device_candidate.get("manifest")
+                if not isinstance(manifest, dict) or not isinstance(manifest.get("digest"), str):
+                    state.fail(
+                        FailureClass.HOT_PAYLOAD_PROVENANCE_MISMATCH,
+                        f"device reports active payload {candidate_name!r} without a valid manifest/digest",
+                    )
+                    return self._finish(state)
+                actual_candidate = {
+                    **state.candidate,
+                    "version": 1,
+                    "name": candidate_name,
+                    "active": True,
+                    "digest": manifest["digest"],
+                    "files": manifest.get("files", []),
+                    "source": state.candidate.get("source", "device_active_pointer"),
+                }
+            else:
+                actual_candidate = {
+                    **state.candidate,
+                    "name": candidate_name,
+                    "active": False,
+                    "digest": "bundled",
+                    "source": "bundled_observed_on_device",
+                }
+            state.candidate = actual_candidate
+            candidate = actual_candidate
+            candidate_digest = str(candidate.get("digest") or "bundled")
+            actual_signature = self.store.attempt_signature(
+                candidate_digest=candidate_digest,
+                profile=profile,
+                target=wanted.value,
+                require_dynamic_library_load=require_dynamic_library_load,
+            )
+            state.attempt_signature = actual_signature
+            retry = self.store.retry_status(actual_signature)
+            state.evidence["candidate_reconciled"] = {"device": device_candidate, "candidate": candidate}
+            if retry["blocked"] and not allow_repeat_failure:
+                state.fail(
+                    FailureClass.RETRY_REQUIRES_CHANGED_EVIDENCE,
+                    "device-confirmed candidate/profile produced the same failure twice; change evidence or run an explicit recovery",
+                    blocked=True,
+                )
+                state.evidence["retry_guard"] = retry
+                return self._finish(state)
+            self.store.save_candidate(candidate_name, candidate)
             self.store.save(state)
 
-            profile_response = await self._agent_request(client, state, "profile/set", {"profile": profile}, timeout=30)
+            profile_response = await self._agent_request(
+                client, state, "profile/set", {"profile": profile}, guard_session=False, timeout=30
+            )
             if not profile_response.get("ok"):
                 state.fail(FailureClass.RUNTIME_ABI_PRECHECK_FAILED, json.dumps(profile_response, sort_keys=True))
                 return self._finish(state)
@@ -347,10 +464,18 @@ class Supervisor:
                 return self._finish(state)
             state.profile = profile_response.get("profile") or state.profile
             state.transition(Stage.PROFILE_READY)
-            self.store.save(state)
 
-            await client.prepare_lab_run(state.run_id)
-            self.store.append_event(state.run_id, "lab_run_prepared")
+            game_session_generation = f"session-{uuid4().hex[:20]}"
+            state.begin_game_session(game_session_generation)
+            state.jit_attach_generation = f"jit-{uuid4().hex[:20]}"
+            self.store.save(state)
+            await client.prepare_lab_run(state.run_id, game_session_generation)
+            self.store.append_event(
+                state.run_id,
+                "lab_run_prepared",
+                game_session_generation=game_session_generation,
+                jit_attach_generation=state.jit_attach_generation,
+            )
             latest_before = await client.read_optional("latestlog.txt")
             latest_baseline = len(latest_before or b"")
 
@@ -362,6 +487,7 @@ class Supervisor:
                     self.jit.start,
                     pid=state.pid,
                     process_generation=state.process_generation,
+                    game_session_generation=game_session_generation,
                     run_id=state.run_id,
                     timeout=min(timeout, 30),
                 )
@@ -374,7 +500,14 @@ class Supervisor:
             state.transition(Stage.JIT_HANDSHAKE_OK, jit_attach=attach.to_dict())
             self.store.save(state)
 
-            launch_response = await self._agent_request(client, state, "launch", {}, timeout=30)
+            launch_response = await self._agent_request(
+                client,
+                state,
+                "launch",
+                {"game_session_generation": game_session_generation},
+                guard_session=False,
+                timeout=30,
+            )
             if not launch_response.get("ok"):
                 state.fail(FailureClass.RUNTIME_ABI_PRECHECK_FAILED, json.dumps(launch_response, sort_keys=True))
                 return self._finish(state)
@@ -384,7 +517,6 @@ class Supervisor:
             state.transition(Stage.LAUNCH_ACCEPTED)
             self.store.save(state)
 
-            wanted = Stage(target.upper())
             if wanted == Stage.LAUNCH_ACCEPTED:
                 state.transition(Stage.PASS, target=wanted.value)
                 return self._finish(state)
@@ -413,7 +545,7 @@ class Supervisor:
                 state.fail(failure, str(exc))
                 return self._finish(state)
 
-            identity_probe = await self._agent_request(client, state, "status", guard_generation=False, timeout=10)
+            identity_probe = await self._agent_request(client, state, "status", timeout=10)
             if not identity_probe.get("ok") or self._observe_identity(state, identity_probe):
                 state.fail(
                     FailureClass.JIT_VERIFICATION_FAILURE,
@@ -431,7 +563,7 @@ class Supervisor:
             seen_events: set[tuple] = set()
             while monotonic() < deadline:
                 app_events = await client.read_events(state.run_id)
-                lab_events = await client.read_lab_events(state.run_id)
+                lab_events = await client.read_lab_events(state.run_id, game_session_generation)
                 events = [("app", event) for event in app_events] + [("lab", event) for event in lab_events]
                 for source, event in events:
                     if source == "lab" and event.get("protocol") != "amethyst-lab/v1":
@@ -462,6 +594,26 @@ class Supervisor:
 
                     event_name = event.get("event") or event.get("stage")
                     mapped = EVENT_TO_STAGE.get(event_name)
+                    if mapped and source == "app" and event.get("game_session_generation") != game_session_generation:
+                        self.store.append_event(
+                            state.run_id,
+                            "stale_session_event_ignored",
+                            event=event_name,
+                            observed_session=event.get("game_session_generation"),
+                            expected_session=game_session_generation,
+                        )
+                        continue
+                    if mapped == Stage.RENDERER_READY and candidate.get("active"):
+                        provenance_ok = event.get("provenance_ok") is True
+                        observed_digest = event.get("candidate_digest")
+                        if not provenance_ok or observed_digest != candidate_digest:
+                            state.fail(
+                                FailureClass.HOT_PAYLOAD_PROVENANCE_MISMATCH,
+                                f"renderer_ready provenance did not match active candidate {candidate_digest}: "
+                                f"ok={provenance_ok} observed_digest={observed_digest!r}",
+                            )
+                            state.evidence["renderer_provenance_event"] = event
+                            return self._finish(state)
                     if mapped:
                         state.transition(mapped, last_event_source=source, last_app_event=event)
                         self.store.save(state)
@@ -469,10 +621,19 @@ class Supervisor:
                             state.transition(Stage.PASS, target=wanted.value)
                             return self._finish(state)
                     if event_name in {"crashed", "failed"}:
-                        state.fail(FailureClass.AMETHYST_CRASH, json.dumps(event, sort_keys=True))
+                        failure_name = event.get("failure_class")
+                        try:
+                            classified = FailureClass(failure_name) if failure_name else FailureClass.AMETHYST_CRASH
+                        except ValueError:
+                            classified = FailureClass.AMETHYST_CRASH
+                        state.fail(classified, json.dumps(event, sort_keys=True))
                         return self._finish(state)
                 await asyncio.sleep(0.25)
-            timeout_class = FailureClass.WORLD_LOAD_TIMEOUT if wanted == Stage.WORLD_READY else FailureClass.MC_READY_TIMEOUT
+            timeout_class = (
+                FailureClass.WORLD_LOAD_TIMEOUT
+                if wanted in {Stage.WORLD_READY, Stage.CHUNKS_STABLE}
+                else FailureClass.MC_READY_TIMEOUT
+            )
             state.fail(timeout_class, f"target {wanted.value} was not observed before timeout")
             return self._finish(state)
         except TimeoutError as exc:
@@ -491,9 +652,63 @@ class Supervisor:
                 "failure": FailureClass.AGENT_UNREACHABLE.value,
                 "detail": "amethystd Python environment lacks pymobiledevice3",
             }
+        path = Path(local_path).expanduser().resolve()
         client = AgentContainerClient(self.device_udid, self.bundle_id)
-        manifest = await client.stage_payload(local_path, name)
-        return {"ok": True, "manifest": manifest}
+        manifest = await client.stage_payload(path, name)
+        embedded_commit = None
+        if path.is_file():
+            try:
+                match = re.search(rb"Build commit:\s*([0-9a-fA-F]{7,40})", path.read_bytes())
+                if match:
+                    embedded_commit = match.group(1).decode().lower()
+            except OSError:
+                pass
+        candidate = {
+            "version": 1,
+            "name": name,
+            "active": True,
+            "digest": manifest["digest"],
+            "files": manifest["files"],
+            "source_path": str(path),
+            "embedded_build_commit": embedded_commit,
+            "staged_at": time(),
+        }
+        self.store.save_candidate(name, candidate)
+        self.store.reset_retry_guard(f"payload {name} changed to {manifest['digest']}")
+        return {"ok": True, "manifest": manifest, "candidate": candidate}
+
+    async def inspect_payload(self, name: str) -> dict[str, Any]:
+        if not self.device_udid:
+            return {"ok": False, "failure": FailureClass.DEVICE_NOT_FOUND.value, "detail": "device UDID is required"}
+        client = AgentContainerClient(self.device_udid, self.bundle_id)
+        device = await client.inspect_payload(name)
+        host = self.store.load_candidate(name)
+        if device.get("active") and isinstance(device.get("manifest"), dict):
+            digest = device["manifest"].get("digest")
+            if host is None or host.get("digest") != digest or not host.get("active"):
+                host = {
+                    "version": 1,
+                    "name": name,
+                    "active": True,
+                    "digest": digest,
+                    "files": device["manifest"].get("files", []),
+                    "source": "reconciled_from_device",
+                    "staged_at": None,
+                }
+                self.store.save_candidate(name, host)
+        return {"ok": True, "name": name, "device": device, "host": host}
+
+    async def clear_payload(self, name: str) -> dict[str, Any]:
+        if not self.device_udid:
+            return {"ok": False, "failure": FailureClass.DEVICE_NOT_FOUND.value, "detail": "device UDID is required"}
+        client = AgentContainerClient(self.device_udid, self.bundle_id)
+        result = await client.clear_payload(name)
+        host = self.store.load_candidate(name) or {"version": 1, "name": name}
+        host.update({"active": False, "cleared_at": time()})
+        self.store.save_candidate(name, host)
+        self.store.reset_retry_guard(f"payload {name} cleared")
+        result["host"] = host
+        return result
 
     async def collect(self, run_id: str, *, include_crashes: bool = False, screenshot: bool = True) -> dict[str, Any]:
         artifact_dir = self.store.artifact_dir(run_id)
@@ -548,12 +763,27 @@ class Supervisor:
         return result
 
     def _finish(self, state: RunState) -> dict[str, Any]:
+        if (
+            state.attempt_signature
+            and state.failure
+            and state.failure_fingerprint
+            and state.failure not in {FailureClass.RETRY_REQUIRES_CHANGED_EVIDENCE}
+            and state.stage != Stage.BLOCKED
+        ):
+            self.store.record_failure(
+                state.attempt_signature,
+                failure=state.failure.value,
+                fingerprint=state.failure_fingerprint,
+            )
         self.store.save(state)
         self.store.append_event(
             state.run_id,
             "run_finished",
             stage=state.stage.value,
             failure=state.failure.value if state.failure else None,
+            failure_fingerprint=state.failure_fingerprint,
+            game_session_generation=state.game_session_generation,
+            candidate=state.candidate,
         )
         return {"ok": state.stage == Stage.PASS, "state": state.to_dict()}
 

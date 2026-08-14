@@ -25,13 +25,15 @@ Stable failure classes let Codex change the responsible layer rather than redisc
 | `NATIVE_DYLIB_LOAD_FAILURE` | expected native library missing/incompatible/unloadable | inspect ABI/signature/path; do not blame JIT after JIT proof |
 | `MOD_LOADER_FAILURE` | Fabric/mod bootstrap failure | fix version/mod contract |
 | `RENDERER_INIT_FAILURE` | Mithril/renderer initialization failed | renderer diagnostics/ABI probe |
+| `HOT_PAYLOAD_PROVENANCE_MISMATCH` | staged renderer bytes are valid but runtime EGL/GL symbols do not resolve to that exact image | fail closed; fix loader/image identity before renderer semantics |
 | `METAL_VALIDATION_FAILURE` | Metal API/resource/lifetime validation error | collect Metal diagnostics |
 | `MC_READY_TIMEOUT` | launch accepted but menu/expected MC readiness never observed | collect event/log/crash evidence, classify first missing stage |
 | `WORLD_LOAD_TIMEOUT` | menu ready but deterministic world never reached ready | collect world/chunk/log evidence |
 | `GRAPHICS_REGRESSION` | fixed screenshot/checkpoint differs beyond gate | reject candidate or investigate visual semantics |
 | `PERFORMANCE_REGRESSION` | correctness passes but benchmark regresses | reject/rework candidate |
+| `RETRY_REQUIRES_CHANGED_EVIDENCE` | same device-confirmed experiment produced the same failure twice | change candidate/evidence, perform observed recovery, or provide an explicit diagnostic retry reason |
 | `UNKNOWN` | evidence insufficient | collect more evidence; never guess a successful stage |
 
 ## Required invalidation
 
-A process-generation change always clears `JIT_*`, `DYLD_*`, JVM, renderer, menu, and world readiness. A new run does not inherit PASS evidence from an old run.
+A process-generation change always clears all process/session proof. A new or ended `game_session_generation` also clears `JIT_*`, `DYLD_*`, JVM, renderer, menu, world, chunks, and benchmark readiness even when the Amethyst PID is unchanged. A new run never inherits PASS evidence from an old run/session.

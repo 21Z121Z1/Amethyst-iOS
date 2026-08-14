@@ -4,11 +4,24 @@
   "title": "Amethyst Agent v2 request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["protocol", "request_id", "run_id", "action"],
+  "required": [
+    "protocol",
+    "request_id",
+    "run_id",
+    "action"
+  ],
   "properties": {
-    "protocol": { "const": "amethyst-agent/v2" },
-    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
-    "run_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
+    "protocol": {
+      "const": "amethyst-agent/v2"
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
     "action": {
       "enum": [
         "status",
@@ -21,23 +34,99 @@
         "terminate"
       ]
     },
-    "if_process_generation": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "if_process_generation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "if_game_session_generation": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
     "params": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "profile": { "type": "string", "maxLength": 256 },
-        "version": { "type": "string", "maxLength": 256 },
-        "instance": { "type": "string", "maxLength": 256 },
-        "quickPlaySingleplayer": { "type": "string", "maxLength": 512 },
-        "quick_play_singleplayer": { "type": "string", "maxLength": 512 },
-        "force": { "type": "boolean" },
-        "key": { "type": "integer", "minimum": 0, "maximum": 512 },
-        "action": { "type": "integer", "enum": [0, 1] },
-        "scancode": { "type": "integer", "minimum": 0 },
-        "mods": { "type": "integer", "minimum": 0, "maximum": 255 },
-        "button": { "type": "integer", "minimum": 0, "maximum": 7 }
+        "profile": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "instance": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "quickPlaySingleplayer": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "quick_play_singleplayer": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "force": {
+          "type": "boolean"
+        },
+        "game_session_generation": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,96}$"
+        },
+        "key": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 512
+        },
+        "action": {
+          "type": "integer",
+          "enum": [
+            0,
+            1
+          ]
+        },
+        "scancode": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mods": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "button": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7
+        }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "launch"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "params"
+        ],
+        "properties": {
+          "params": {
+            "required": [
+              "game_session_generation"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

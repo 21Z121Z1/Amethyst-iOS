@@ -16,22 +16,24 @@ From a clean host supervisor state:
 
 1. discover the exact target device and AgentDebug bundle;
 2. launch/reconcile Amethyst and observe Agent v2 `process_generation`;
-3. establish userspace debugserver forwarding for that generation;
-4. attach the UniversalJIT26 processor and observe `AMETHYST_JIT_PROCESSOR_ATTACHED`;
-5. request Minecraft launch so `launchJVM` can emit the UniversalJIT26 breakpoints;
-6. observe host-side UniversalJIT26 RX allocation/page preparation;
-7. independently observe fresh Amethyst log proof for `Got JIT mapping` and the RW/RX mapping;
-8. when external dylibs are required, keep the processor attached and independently observe both DyldLVBypass hook successes;
-9. re-check `process_generation`; any change invalidates all JIT evidence;
-10. terminate/return to launcher and collect the run artifact bundle.
+3. reconcile the iPad active renderer pointer/manifest, then create a fresh `game_session_generation`;
+4. establish userspace debugserver forwarding keyed to host + game-session identity;
+5. attach the UniversalJIT26 processor and observe `AMETHYST_JIT_PROCESSOR_ATTACHED`;
+6. request Minecraft launch with that session generation so `launchJVM` can emit the UniversalJIT26 breakpoints;
+7. observe host-side UniversalJIT26 RX allocation/page preparation;
+8. independently observe fresh Amethyst log proof for `Got JIT mapping` and the RW/RX mapping;
+9. when external dylibs are required, keep the processor attached and independently observe both DyldLVBypass hook successes;
+10. for a hot renderer, require runtime symbol provenance to the device-confirmed staged digest/path;
+11. re-check host and game-session identity; any mismatch invalidates the proof;
+12. terminate/return to launcher, observe that session ended, and collect the run artifact bundle.
 
-Debugger attachment alone is not a PASS. Any PID/process-generation change forces JIT re-establishment.
+Debugger attachment alone is not a PASS. Any PID/process-generation change or new Minecraft game session forces JIT re-establishment.
 
 ## Gate B — Minecraft smoke
 
-`amethystctl run smoke --profile directmetal-26.2 --target WORLD_READY`
+`./tools/amethystctl run smoke --profile directmetal-26.2 --target WORLD_READY`
 
-Acceptance requires a single run artifact proving each reached stage. No manual taps and no fixed sleep may be used as readiness evidence. If the version-specific Fabric/Minecraft lab adapter is not installed/wired, `WORLD_READY` remains unproven rather than inferred from a screenshot.
+Acceptance requires a single run/session artifact proving each reached stage. No manual taps, F3 interpretation, screenshots, panorama motion, `game_running`, or fixed sleep may be used as semantic readiness evidence. For Minecraft 26.2 the repository-built Fabric probe owns TitleScreen/JOIN/player-camera/chunk-stability semantics. If that adapter is not installed/wired, `WORLD_READY` remains unproven.
 
 ## Gate C — graphics correctness
 

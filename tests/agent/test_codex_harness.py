@@ -147,3 +147,72 @@ class AgentDebugShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PayloadLifecycleTests(unittest.TestCase):
+    def test_payload_clear_is_idempotent_and_preserves_staging(self) -> None:
+        from contextlib import asynccontextmanager
+        from unittest.mock import patch
+
+        class Missing(Exception):
+            pass
+
+        class FakeAfc:
+            def __init__(self) -> None:
+                digest = "a" * 64
+                self.files = {
+                    "/Documents/agent-payloads/active/mithril.json": json.dumps({
+                        "name": "mithril",
+                        "digest": digest,
+                        "stage": f"agent-payloads/.staging/{digest}",
+                    }).encode(),
+                    f"/Documents/agent-payloads/.staging/{digest}/manifest.json": json.dumps({
+                        "version": 1, "name": "mithril", "digest": digest, "files": []
+                    }).encode(),
+                }
+
+            async def get_file_contents(self, path: str) -> bytes:
+                if path not in self.files:
+                    raise Missing(path)
+                return self.files[path]
+
+            async def rm(self, path: str) -> None:
+                if path not in self.files:
+                    raise Missing(path)
+                del self.files[path]
+
+        afc = FakeAfc()
+        client = AgentContainerClient("udid", "bundle")
+
+        @asynccontextmanager
+        async def fake_afc():
+            yield afc
+
+        client._afc = fake_afc  # type: ignore[method-assign]
+        fake_module = type("Errors", (), {"AfcFileNotFoundError": Missing})
+        with patch.dict("sys.modules", {"pymobiledevice3.exceptions": fake_module}):
+            first = asyncio.run(client.clear_payload("mithril"))
+            second = asyncio.run(client.clear_payload("mithril"))
+        self.assertTrue(first["cleared"])
+        self.assertFalse(second["cleared"])
+        self.assertTrue(first["staging_preserved"])
+        self.assertIn(f"/Documents/agent-payloads/.staging/{'a' * 64}/manifest.json", afc.files)
+
+
+    def test_payload_inspect_rejects_stage_digest_mismatch(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        client = AgentContainerClient("udid", "bundle")
+        digest = "a" * 64
+        pointer = json.dumps({
+            "name": "mithril",
+            "digest": digest,
+            "stage": "agent-payloads/.staging/" + "b" * 64,
+        }).encode()
+        with patch.object(client, "_read_direct_optional", new=AsyncMock(return_value=pointer)):
+            with self.assertRaisesRegex(RuntimeError, "stage/digest mismatch"):
+                asyncio.run(client.inspect_payload("mithril"))
+
+    def test_payload_name_rejects_path_traversal(self) -> None:
+        client = AgentContainerClient("udid", "bundle")
+        with self.assertRaises(ValueError):
+            asyncio.run(client.clear_payload("../mithril"))
