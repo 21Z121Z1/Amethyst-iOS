@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import configparser
 import importlib.metadata
+import os
 import shutil
+import socket
 import sys
+from uuid import uuid4
 from pathlib import Path
 from typing import Any
+
+from .store import StateStore
 
 
 def _tool_state(*names: str) -> dict[str, Any]:
@@ -40,6 +45,8 @@ def _submodule_state(repo_root: Path) -> dict[str, Any]:
 def collect_host_preflight(repo_root: Path) -> dict[str, Any]:
     """Return one compact prerequisite snapshot before a physical-device iteration."""
     repo_root = repo_root.resolve()
+    python_tuple = sys.version_info[:2]
+    python_supported = (3, 12) <= python_tuple < (3, 14)
     try:
         pmd3_version = importlib.metadata.version("pymobiledevice3")
     except importlib.metadata.PackageNotFoundError:
@@ -66,8 +73,23 @@ def collect_host_preflight(repo_root: Path) -> dict[str, Any]:
     }
     submodules = _submodule_state(repo_root)
 
+    store = StateStore(os.environ.get("AMETHYST_AGENT_HOME") or (repo_root / ".amethyst-agent"))
+    socket_path = store.socket_path
+    socket_probe = store.runtime_root / f"probe-{uuid4().hex[:8]}.sock"
+    socket_error = None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.bind(str(socket_probe))
+    except OSError as exc:
+        socket_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        socket_probe.unlink(missing_ok=True)
+    socket_ready = socket_error is None
+
     device_harness_ready = (
-        pmd3_version is not None
+        python_supported
+        and socket_ready
+        and pmd3_version is not None
         and tools["pymobiledevice3_cli"]["available"]
         and tools["xcrun"]["available"]
         and all(required_files[key] for key in ("requirements_agent", "jit_processor", "agent_protocol"))
@@ -79,6 +101,10 @@ def collect_host_preflight(repo_root: Path) -> dict[str, Any]:
     )
 
     remediation: list[str] = []
+    if not python_supported:
+        remediation.append("run the harness with CPython 3.12 or 3.13; use tools/bootstrap-agent")
+    if not socket_ready:
+        remediation.append("set AMETHYST_AGENT_RUNTIME to a short writable directory such as /tmp/amethyst-agent-runtime")
     if pmd3_version is None or not tools["pymobiledevice3_cli"]["available"]:
         remediation.append("install requirements-agent.txt in the same Python environment used by amethystd")
     if not tools["xcrun"]["available"]:
@@ -102,8 +128,17 @@ def collect_host_preflight(repo_root: Path) -> dict[str, Any]:
         "python": {
             "executable": sys.executable,
             "version": sys.version.split()[0],
+            "supported": python_supported,
+            "supported_range": ">=3.12,<3.14",
             "pymobiledevice3_available": pmd3_version is not None,
             "pymobiledevice3_version": pmd3_version,
+        },
+        "daemon_runtime": {
+            "root": str(store.runtime_root),
+            "socket": str(socket_path),
+            "socket_path_bytes": len(os.fsencode(str(socket_path))),
+            "bind_probe_ok": socket_ready,
+            "bind_probe_error": socket_error,
         },
         "tools": tools,
         "submodules": submodules,

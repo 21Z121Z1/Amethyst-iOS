@@ -86,19 +86,40 @@ async def call(method: str, params: dict | None = None) -> dict:
     return await request_daemon(store.socket_path, method, params)
 
 
-def daemon_healthy(store: StateStore) -> bool:
+def daemon_probe(store: StateStore) -> dict | None:
     if not store.socket_path.exists():
-        return False
+        return None
     try:
         result = asyncio.run(request_daemon(store.socket_path, "ping"))
-        return result.get("ok") is True and result.get("daemon") == "amethystd"
+        if result.get("ok") is True and result.get("daemon") == "amethystd":
+            return result
     except (ConnectionError, FileNotFoundError, OSError, RuntimeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def daemon_healthy(store: StateStore) -> bool:
+    result = daemon_probe(store)
+    if not result:
         return False
+    observed = result.get("python_executable")
+    if not observed:
+        return False
+    try:
+        return Path(observed).resolve() == Path(sys.executable).resolve()
+    except OSError:
+        return observed == sys.executable
 
 
 def ensure_daemon(store: StateStore, *, start: bool) -> None:
-    if daemon_healthy(store):
+    probe = daemon_probe(store)
+    if probe and daemon_healthy(store):
         return
+    if probe and not daemon_healthy(store):
+        raise RuntimeError(
+            "amethystd is running under a different Python interpreter "
+            f"({probe.get('python_executable')}); use `amethystctl daemon restart` from the desired harness environment"
+        )
     if store.socket_path.exists():
         store.socket_path.unlink(missing_ok=True)
     if not start:
@@ -191,7 +212,7 @@ def parser() -> argparse.ArgumentParser:
     configure.add_argument("--bundle-id")
 
     daemon = sub.add_parser("daemon")
-    daemon.add_argument("action", choices=["start", "stop", "status"])
+    daemon.add_argument("action", choices=["start", "stop", "restart", "status"])
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("app", help="Development-signed .app directory or .ipa")
@@ -222,12 +243,19 @@ def parser() -> argparse.ArgumentParser:
     smoke.add_argument("--target", default="WORLD_READY")
     smoke.add_argument("--timeout", type=float, default=180)
     smoke.add_argument("--no-dynamic-dylib", action="store_true")
+    smoke.add_argument("--candidate", default="mithril", help="active hot-payload candidate name")
+    smoke.add_argument("--allow-repeat-failure", action="store_true", help="override unchanged-failure guard for one diagnostic run")
+    smoke.add_argument("--retry-reason", help="explicit recovery/diagnostic reason; resets the unchanged-failure guard")
 
     payload = sub.add_parser("payload")
     payload_sub = payload.add_subparsers(dest="payload_action", required=True)
     stage = payload_sub.add_parser("stage")
     stage.add_argument("path")
     stage.add_argument("--name", required=True)
+    inspect_payload = payload_sub.add_parser("inspect")
+    inspect_payload.add_argument("--name", required=True)
+    clear = payload_sub.add_parser("clear")
+    clear.add_argument("--name", required=True)
 
     runtime = sub.add_parser("runtime")
     runtime_sub = runtime.add_subparsers(dest="runtime_action", required=True)
@@ -318,14 +346,31 @@ def main() -> int:
         if args.command == "daemon":
             if args.action == "start":
                 ensure_daemon(store, start=True)
-                return emit({"ok": True, "healthy": True, "socket": str(store.socket_path)})
+                return emit({"ok": True, "healthy": True, "socket": str(store.socket_path), "daemon": daemon_probe(store)})
             if args.action == "stop":
                 ensure_daemon(store, start=False)
                 return emit(asyncio.run(call("shutdown")))
+            if args.action == "restart":
+                probe = daemon_probe(store)
+                if probe:
+                    try:
+                        asyncio.run(request_daemon(store.socket_path, "shutdown"))
+                    except Exception:
+                        pass
+                    deadline = monotonic() + 3
+                    while monotonic() < deadline and store.socket_path.exists():
+                        sleep(0.05)
+                    store.socket_path.unlink(missing_ok=True)
+                ensure_daemon(store, start=True)
+                return emit({"ok": True, "healthy": True, "socket": str(store.socket_path), "daemon": daemon_probe(store)})
+            probe = daemon_probe(store)
             healthy = daemon_healthy(store)
-            return emit({"ok": healthy, "healthy": healthy, "socket": str(store.socket_path)})
+            return emit({"ok": healthy, "healthy": healthy, "socket": str(store.socket_path), "daemon": probe})
 
-        ensure_daemon(store, start=False)
+        # Routine operational commands own daemon availability so Codex does not need
+        # to hand-manage a background process. Interpreter mismatches remain explicit
+        # because silently killing an active daemon could invalidate a device run.
+        ensure_daemon(store, start=True)
         if args.command == "doctor":
             result = asyncio.run(call("doctor"))
             result["host_preflight"] = collect_host_preflight(REPO_ROOT)
@@ -342,9 +387,16 @@ def main() -> int:
                 "target": args.target,
                 "timeout": args.timeout,
                 "require_dynamic_library_load": not args.no_dynamic_dylib,
+                "candidate_name": args.candidate,
+                "allow_repeat_failure": args.allow_repeat_failure,
+                "retry_reason": args.retry_reason,
             })))
         if args.command == "payload" and args.payload_action == "stage":
             return emit(asyncio.run(call("stage_payload", {"local_path": args.path, "name": args.name})))
+        if args.command == "payload" and args.payload_action == "inspect":
+            return emit(asyncio.run(call("inspect_payload", {"name": args.name})))
+        if args.command == "payload" and args.payload_action == "clear":
+            return emit(asyncio.run(call("clear_payload", {"name": args.name})))
         if args.command == "logs" and args.logs_action == "query":
             return emit(asyncio.run(call("query_logs", {
                 "source": args.source,

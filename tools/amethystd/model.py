@@ -31,6 +31,7 @@ class Stage(str, Enum):
     MENU_READY = "MENU_READY"
     WORLD_LOADING = "WORLD_LOADING"
     WORLD_READY = "WORLD_READY"
+    CHUNKS_STABLE = "CHUNKS_STABLE"
     WARMUP = "WARMUP"
     MEASURING = "MEASURING"
     COLLECTING = "COLLECTING"
@@ -62,6 +63,8 @@ class FailureClass(str, Enum):
     NATIVE_DYLIB_LOAD_FAILURE = "NATIVE_DYLIB_LOAD_FAILURE"
     MOD_LOADER_FAILURE = "MOD_LOADER_FAILURE"
     RENDERER_INIT_FAILURE = "RENDERER_INIT_FAILURE"
+    HOT_PAYLOAD_PROVENANCE_MISMATCH = "HOT_PAYLOAD_PROVENANCE_MISMATCH"
+    RETRY_REQUIRES_CHANGED_EVIDENCE = "RETRY_REQUIRES_CHANGED_EVIDENCE"
     METAL_VALIDATION_FAILURE = "METAL_VALIDATION_FAILURE"
     MC_READY_TIMEOUT = "MC_READY_TIMEOUT"
     WORLD_LOAD_TIMEOUT = "WORLD_LOAD_TIMEOUT"
@@ -86,6 +89,7 @@ PROCESS_SCOPED_STAGES = {
     Stage.MENU_READY,
     Stage.WORLD_LOADING,
     Stage.WORLD_READY,
+    Stage.CHUNKS_STABLE,
     Stage.WARMUP,
     Stage.MEASURING,
 }
@@ -124,10 +128,14 @@ class RunState:
     failure_fingerprint: str | None = None
     pid: int | None = None
     process_generation: str | None = None
+    game_session_generation: str | None = None
+    jit_attach_generation: str | None = None
     jit_exec_ready: bool = False
     dynamic_library_load_ready: bool = False
     app_state: str | None = None
     profile: dict[str, Any] = field(default_factory=dict)
+    candidate: dict[str, Any] = field(default_factory=dict)
+    attempt_signature: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time)
     updated_at: float = field(default_factory=time)
@@ -138,21 +146,45 @@ class RunState:
         if evidence:
             self.evidence.update(evidence)
 
+    def _clear_session_evidence(self) -> None:
+        self.jit_exec_ready = False
+        self.dynamic_library_load_ready = False
+        self.jit_attach_generation = None
+        for key in list(self.evidence):
+            if key in {"last_event_source", "last_app_event"} or key.startswith(
+                ("jit_", "dyld_", "jvm_", "renderer_", "minecraft_", "menu_", "world_", "chunks_", "benchmark_")
+            ):
+                self.evidence.pop(key, None)
+
+    def begin_game_session(self, generation: str) -> None:
+        if not generation:
+            raise ValueError("game session generation must not be empty")
+        self._clear_session_evidence()
+        self.game_session_generation = generation
+        self.failure = None
+        self.failure_detail = None
+        self.failure_fingerprint = None
+        self.updated_at = time()
+
+    def end_game_session(self) -> None:
+        self._clear_session_evidence()
+        self.game_session_generation = None
+        self.app_state = "launcher"
+        if self.stage in PROCESS_SCOPED_STAGES or self.stage in {Stage.PASS, Stage.FAIL, Stage.BLOCKED}:
+            self.stage = Stage.AGENT_READY
+        self.updated_at = time()
+
     def observe_process(self, pid: int, generation: str) -> bool:
-        """Observe process identity. Return True when process-scoped state was invalidated."""
+        """Observe host process identity. Return True when all session-scoped proof was invalidated."""
         changed = self.pid is not None and (self.pid != pid or self.process_generation != generation)
         first_identity = self.pid is None or self.process_generation is None
         self.pid = pid
         self.process_generation = generation
         self.updated_at = time()
         if changed:
-            self.jit_exec_ready = False
-            self.dynamic_library_load_ready = False
+            self.end_game_session()
             self.app_state = None
-            for key in list(self.evidence):
-                if key.startswith(("jit_", "dyld_", "jvm_", "renderer_", "minecraft_", "world_")):
-                    self.evidence.pop(key, None)
-            if self.stage in PROCESS_SCOPED_STAGES or self.stage in {Stage.PASS, Stage.FAIL}:
+            if self.stage in PROCESS_SCOPED_STAGES or self.stage in {Stage.PASS, Stage.FAIL, Stage.BLOCKED, Stage.AGENT_READY}:
                 self.stage = Stage.APP_LAUNCHED
             self.failure = None
             self.failure_detail = None

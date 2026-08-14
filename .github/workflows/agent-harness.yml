@@ -6,6 +6,8 @@ on:
     paths:
       - 'tools/amethystd/**'
       - 'tools/amethystctl.py'
+      - 'tools/amethystctl'
+      - 'tools/bootstrap-agent'
       - 'tests/agent/**'
       - 'agent-protocol/**'
       - 'lab/**'
@@ -19,6 +21,8 @@ on:
     paths:
       - 'tools/amethystd/**'
       - 'tools/amethystctl.py'
+      - 'tools/amethystctl'
+      - 'tools/bootstrap-agent'
       - 'tests/agent/**'
       - 'agent-protocol/**'
       - 'lab/**'
@@ -30,53 +34,110 @@ on:
       - '.github/workflows/agent-harness.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   contract-tests:
     runs-on: macos-26
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: '25'
+      - name: Setup Gradle for Minecraft 26.2 probe
+        uses: gradle/actions/setup-gradle@0f4528296b4bc09e8ae0fc7be30185a4ab435545 # v6.0.0
+        with:
+          gradle-version: '9.5.1'
       - name: Install host harness dependencies
         run: python3 -m pip install -r requirements-agent.txt
       - name: Compile host harness
         run: python3 -m compileall -q tools/amethystd tools/amethystctl.py
-      - name: Run host harness tests
-        run: python3 -m unittest discover -s tests/agent -v
+      - name: Run host harness contract tests
+        run: |
+          mkdir -p ci-evidence
+          python3 -m unittest discover -s tests/agent -v 2>&1 | tee ci-evidence/unit-tests.txt
       - name: Verify protocol JSON
         run: |
           python3 -m json.tool agent-protocol/v2.schema.json >/dev/null
           python3 -m json.tool agent-protocol/lab-event-v1.schema.json >/dev/null
-      - name: Verify Codex-facing CLI and host preflight
+      - name: Verify Codex-facing CLI, bootstrap and host preflight
         run: |
-          python3 tools/amethystctl.py --help >/dev/null
-          python3 tools/amethystctl.py runtime verify --help >/dev/null
-          python3 tools/amethystctl.py logs query --help >/dev/null
-          python3 tools/amethystctl.py input key --help >/dev/null
-          python3 tools/amethystctl.py frame probe --help >/dev/null
-          python3 tools/amethystctl.py doctor --host-only
-      - name: Compile test-only Java lab event writer
+          export AMETHYST_AGENT_PYTHON="$pythonLocation/bin/python3"
+          bash -n tools/amethystctl tools/bootstrap-agent
+          ./tools/amethystctl --help >/dev/null
+          ./tools/amethystctl runtime verify --help >/dev/null
+          ./tools/amethystctl logs query --help >/dev/null
+          ./tools/amethystctl input key --help >/dev/null
+          ./tools/amethystctl frame probe --help >/dev/null
+          ./tools/amethystctl payload inspect --help >/dev/null
+          ./tools/amethystctl payload clear --help >/dev/null
+          ./tools/amethystctl daemon --help >/dev/null
+          ./tools/amethystctl doctor --host-only | tee ci-evidence/host-preflight.json
+      - name: Exercise implicit daemon startup and recovery lifecycle
+        env:
+          AMETHYST_AGENT_HOME: /tmp/amethyst-ci-daemon
+        run: |
+          export AMETHYST_AGENT_PYTHON="$pythonLocation/bin/python3"
+          rm -rf "$AMETHYST_AGENT_HOME"
+          ./tools/amethystctl status | tee ci-evidence/daemon-autostart-status.json
+          ./tools/amethystctl daemon status | tee ci-evidence/daemon-status.json
+          ./tools/amethystctl daemon restart | tee ci-evidence/daemon-restart.json
+          ./tools/amethystctl daemon status | tee ci-evidence/daemon-status-after-restart.json
+          ./tools/amethystctl daemon stop | tee ci-evidence/daemon-stop.json
+      - name: Compile generic lab event writer
         run: |
           rm -rf /tmp/amethyst-lab-classes
           mkdir -p /tmp/amethyst-lab-classes
           javac -d /tmp/amethyst-lab-classes lab/minecraft-probe/src/main/java/org/angelauramc/amethyst/lab/LabEvents.java
+      - name: Build authoritative Minecraft 26.2 Fabric probe
+        working-directory: lab/minecraft-probe/mc26.2
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace build 2>&1 | tee "$GITHUB_WORKSPACE/ci-evidence/mc262-build.log"
+          JAR=$(find build/libs -name '*.jar' ! -name '*-sources.jar' -type f | head -1)
+          test -n "$JAR"
+          jar tf "$JAR" | tee "$GITHUB_WORKSPACE/ci-evidence/mc262-probe-jar.txt"
+          jar tf "$JAR" | grep -q 'org/angelauramc/amethyst/lab/LabEvents.class'
+          jar tf "$JAR" | grep -q 'org/angelauramc/amethyst/lab/mc262/Minecraft262Probe.class'
+          jar tf "$JAR" | grep -q 'fabric.mod.json'
+          cp "$JAR" "$GITHUB_WORKSPACE/ci-evidence/amethyst-mc262-probe.jar"
+          shasum -a 256 "$JAR" | tee "$GITHUB_WORKSPACE/ci-evidence/mc262-probe-sha256.txt"
+      - name: Record harness provenance
+        run: |
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "runner_os=$(sw_vers -productVersion)"
+            echo "runner_arch=$(uname -m)"
+            echo "python=$(python3 --version 2>&1)"
+            echo "java=$(java -version 2>&1 | head -1)"
+            echo "gradle=$(gradle --version | awk '/Gradle / {print $2; exit}')"
+          } | tee ci-evidence/provenance.txt
+      - name: Upload harness contract evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: amethyst-harness-contract-evidence
+          retention-days: 14
+          if-no-files-found: error
+          path: ci-evidence
 
   native-build:
     runs-on: macos-26
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: zulu
           java-version: '8'
@@ -84,8 +145,9 @@ jobs:
         run: brew install ldid wget
       - name: Build native target
         run: make native PLATFORM=2 BOOTJDK="$JAVA_HOME/bin" MAKEFLAGS=-j2
-      - name: Verify native executable shape
+      - name: Verify native executable and record provenance
         run: |
+          mkdir -p ci-native-evidence
           python3 - <<'PY'
           from pathlib import Path
           from tools.amethystd.debug_package import require_macho_executable
@@ -93,3 +155,23 @@ jobs:
           require_macho_executable(path)
           print(path)
           PY
+          APP=Natives/build/AngelAuraAmethyst.app/AngelAuraAmethyst
+          file "$APP" | tee ci-native-evidence/file.txt
+          shasum -a 256 "$APP" | tee ci-native-evidence/sha256.txt
+          dwarfdump --uuid "$APP" | tee ci-native-evidence/uuid.txt
+          codesign -dvvv "$APP" 2>ci-native-evidence/codesign.txt || true
+          strings "$APP" | grep -E 'game_session_generation|HOT_PAYLOAD_PROVENANCE_MISMATCH|renderer_symbols_resolved_to_different_image|provenance_ok' | sort -u | tee ci-native-evidence/harness-markers.txt
+          grep -q 'game_session_generation' ci-native-evidence/harness-markers.txt
+          grep -q 'HOT_PAYLOAD_PROVENANCE_MISMATCH' ci-native-evidence/harness-markers.txt
+          grep -q 'renderer_symbols_resolved_to_different_image' ci-native-evidence/harness-markers.txt
+          grep -q 'provenance_ok' ci-native-evidence/harness-markers.txt
+          cp "$APP" ci-native-evidence/AngelAuraAmethyst
+          printf 'commit=%s\n' "$GITHUB_SHA" | tee ci-native-evidence/provenance.txt
+      - name: Upload native build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: amethyst-native-build-evidence
+          retention-days: 14
+          if-no-files-found: warn
+          path: ci-native-evidence

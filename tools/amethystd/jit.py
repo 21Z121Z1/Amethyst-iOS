@@ -45,7 +45,7 @@ class JITHostEvidence:
 
 
 class JITSession:
-    """Own debugserver forwarding and UniversalJIT26 processing for one app process generation.
+    """Own debugserver forwarding and UniversalJIT26 processing for one app process and Minecraft game-session generation.
 
     Attachment and JIT proof are deliberately separate.  The processor must be
     attached *before* Minecraft launch so it can catch the breakpoints emitted
@@ -63,7 +63,7 @@ class JITSession:
         self.debugserver: subprocess.Popen[str] | None = None
         self.processor: subprocess.Popen[str] | None = None
         self._handles: list[TextIO] = []
-        self.identity: tuple[int, str] | None = None
+        self.identity: tuple[int, str, str] | None = None
         self.processor_log: Path | None = None
         self.debugserver_log: Path | None = None
         self.port: int | None = None
@@ -107,7 +107,7 @@ class JITSession:
             sleep(0.05)
         raise TimeoutError("debugserver local forwarding did not claim its local port")
 
-    def _processor_command(self, port: int, pid: int, run_id: str, process_generation: str) -> list[str]:
+    def _processor_command(self, port: int, pid: int, run_id: str, process_generation: str, game_session_generation: str) -> list[str]:
         configured = os.environ.get("AMETHYST_JIT_PROCESSOR")
         values = {
             "host": "127.0.0.1",
@@ -115,6 +115,7 @@ class JITSession:
             "pid": str(pid),
             "run_id": run_id,
             "process_generation": process_generation,
+            "game_session_generation": game_session_generation,
         }
         if configured:
             return [part.format(**values) for part in shlex.split(configured)]
@@ -143,6 +144,7 @@ class JITSession:
         *,
         pid: int,
         process_generation: str,
+        game_session_generation: str,
         run_id: str,
         deadline: float,
         attempt: int,
@@ -182,7 +184,7 @@ class JITSession:
         self._wait_listener(port, deadline)
 
         self.processor = subprocess.Popen(
-            self._processor_command(port, pid, run_id, process_generation),
+            self._processor_command(port, pid, run_id, process_generation, game_session_generation),
             text=True,
             stdout=processor_handle,
             stderr=subprocess.STDOUT,
@@ -210,10 +212,11 @@ class JITSession:
         *,
         pid: int,
         process_generation: str,
+        game_session_generation: str,
         run_id: str,
         timeout: float = 20,
     ) -> JITAttachEvidence:
-        identity = (pid, process_generation)
+        identity = (pid, process_generation, game_session_generation)
         if self.identity and self.identity != identity:
             self.close()
         elif self.processor and self.processor.poll() is None and self.identity == identity:
@@ -229,6 +232,7 @@ class JITSession:
                 return self._start_attempt(
                     pid=pid,
                     process_generation=process_generation,
+                    game_session_generation=game_session_generation,
                     run_id=run_id,
                     deadline=deadline,
                     attempt=attempt,

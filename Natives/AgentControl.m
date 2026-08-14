@@ -19,7 +19,9 @@
 
 static dispatch_source_t AgentInboxTimer;
 static NSString *AgentActiveRunID;
+static NSString *AgentActiveGameSessionGeneration;
 static uint64_t AgentEventSequence;
+static NSString *AgentGameSessionGeneration(void);
 
 static NSString *AgentSafeIdentifier(NSString *value) {
     if (value.length == 0 || value.length > 96) return nil;
@@ -100,6 +102,8 @@ static void AgentWriteResponse(NSString *protocol, NSString *requestID, NSString
     response[@"timestamp"] = @([NSDate.date timeIntervalSince1970]);
     response[@"process_id"] = @(getpid());
     response[@"process_generation"] = AgentProcessGeneration();
+    NSString *session = AgentGameSessionGeneration();
+    if (session.length) response[@"game_session_generation"] = session;
     if ([protocol isEqualToString:@"amethyst-agent/v2"]) response[@"run_id"] = AgentSafeIdentifier(runID) ?: @"invalid";
     AgentWriteJSON(response, AgentResponsePath(requestID));
 }
@@ -126,6 +130,8 @@ static void AgentWriteEvent(NSString *runID, NSString *event, NSDictionary *payl
         record[@"timestamp"] = @([NSDate.date timeIntervalSince1970]);
         record[@"process_id"] = @(getpid());
         record[@"process_generation"] = AgentProcessGeneration();
+        NSString *session = AgentGameSessionGeneration();
+        if (session.length) record[@"game_session_generation"] = session;
 
         NSError *error = nil;
         NSData *json = [NSJSONSerialization dataWithJSONObject:record options:0 error:&error];
@@ -165,6 +171,18 @@ void AgentControlEmitActiveEvent(NSString *event, NSDictionary *payload) {
 static void AgentSetActiveRunID(NSString *runID) {
     @synchronized (NSProcessInfo.processInfo) {
         AgentActiveRunID = [AgentSafeIdentifier(runID) copy];
+    }
+}
+
+static void AgentSetActiveGameSessionGeneration(NSString *generation) {
+    @synchronized (NSProcessInfo.processInfo) {
+        AgentActiveGameSessionGeneration = [AgentSafeIdentifier(generation) copy];
+    }
+}
+
+static NSString *AgentGameSessionGeneration(void) {
+    @synchronized (NSProcessInfo.processInfo) {
+        return [AgentActiveGameSessionGeneration copy];
     }
 }
 
@@ -280,13 +298,17 @@ static NSDictionary *AgentStatus(void) {
         profile[@"quick_play_singleplayer"] = selected[@"quickPlaySingleplayer"];
     NSString *instance = getPrefObject(@"general.game_directory");
     if (instance) profile[@"instance"] = instance;
-    return @{
+    NSMutableDictionary *result = [@{
         @"ok": @YES,
         @"state": SurfaceViewController.isRunning ? @"game_running" : @"launcher",
         @"profile": profile,
         @"process_id": @(getpid()),
         @"process_generation": AgentProcessGeneration(),
-    };
+        @"game_session_active": @(SurfaceViewController.isRunning),
+    } mutableCopy];
+    NSString *session = AgentGameSessionGeneration();
+    if (session.length) result[@"game_session_generation"] = session;
+    return result;
 }
 
 static NSDictionary *AgentRuntimeProbe(void) {
@@ -461,11 +483,34 @@ static void AgentProcessV2Envelope(NSDictionary *request, NSString *claimedReque
         });
         return;
     }
+    NSString *sessionGuard = [request[@"if_game_session_generation"] isKindOfClass:NSString.class]
+        ? request[@"if_game_session_generation"] : nil;
+    if (sessionGuard.length && ![sessionGuard isEqualToString:AgentGameSessionGeneration()]) {
+        AgentWriteResponseV2(requestID, runID, @{
+            @"ok": @NO, @"state": @"stale_game_session_generation", @"error": @"game session generation changed"
+        });
+        return;
+    }
 
+    BOOL isLaunch = [action isEqualToString:@"launch"];
+    NSString *requestedSession = [params[@"game_session_generation"] isKindOfClass:NSString.class]
+        ? AgentSafeIdentifier(params[@"game_session_generation"]) : nil;
+    if (isLaunch && !requestedSession.length) {
+        AgentWriteResponseV2(requestID, runID, @{
+            @"ok": @NO, @"state": @"rejected", @"error": @"launch requires a valid game_session_generation"
+        });
+        return;
+    }
+    if (isLaunch) {
+        AgentSetActiveRunID(runID);
+        AgentSetActiveGameSessionGeneration(requestedSession);
+    }
     AgentWriteEvent(runID, @"command_received", @{ @"action": action, @"request_id": requestID });
-    if ([action isEqualToString:@"launch"]) AgentSetActiveRunID(runID);
     NSDictionary *result = AgentHandleAction(action, params);
-    if ([action isEqualToString:@"launch"] && ![result[@"ok"] boolValue]) AgentSetActiveRunID(nil);
+    if (isLaunch && ![result[@"ok"] boolValue]) {
+        AgentSetActiveRunID(nil);
+        AgentSetActiveGameSessionGeneration(nil);
+    }
     AgentWriteResponseV2(requestID, runID, result);
     AgentWriteEvent(runID, @"command_completed", @{
         @"action": action,

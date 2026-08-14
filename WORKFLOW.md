@@ -2,51 +2,88 @@
 
 ## Goal
 
-Make real-device Amethyst/Minecraft debugging a resumable, evidence-driven transaction. Codex chooses hypotheses and code changes; deterministic software owns device connections, JIT lifetime, process identity, transfers, telemetry, and artifact collection.
+Make real-device Amethyst/Minecraft debugging a resumable, evidence-driven transaction. Codex chooses hypotheses and code changes; deterministic software owns Python/runtime bootstrap, device connections, host/game-session identity, JIT lifetime, payload provenance, transfers, telemetry and artifact collection.
 
-## Required loop
+## One-time host bootstrap
 
-1. Start/reuse `amethystd`.
-2. `amethystctl doctor` and resolve the exact target bundle/device.
-3. Start a run with a unique `run_id`; never reuse evidence from another run.
-4. Launch/reconcile Amethyst and observe the app's `process_generation`.
-5. Apply deterministic profile/runtime configuration through Agent v2.
-6. Start debugserver forwarding and attach the bundled UniversalJIT26 processor for that process generation. Attachment is only a prerequisite, not JIT success.
-7. Request Minecraft launch. Only now can `launchJVM` emit the UniversalJIT26 protocol breakpoints.
-8. Require both host-side RX preparation evidence and fresh app-side RW/RX mapping evidence before declaring executable JIT ready. If dynamic unsigned runtime/dylib loading is required, also require keep-attached plus both fresh DyldLVBypass hook proofs.
-9. Re-check `process_generation`; a change invalidates all JIT/Dyld/JVM evidence.
-10. Advance Minecraft stages only on observed app/lab events, never fixed sleeps.
-11. On failure, collect run-scoped logs/crashes/state, classify the first failing layer, then change only the responsible layer.
-12. Re-run with a new `run_id`. A fix is accepted only by new evidence.
-13. Once correctness gates pass, run deterministic performance A/B measurements; accept only a positive or neutral correctness result with the intended performance improvement.
-14. Commit/push accepted changes and continue to the next highest-value goal.
+```sh
+./tools/bootstrap-agent
+./tools/amethystctl configure --device <UDID> --bundle-id <AgentDebug bundle id>
+./tools/amethystctl doctor
+```
 
-## Reconciliation
+Use `./tools/amethystctl` thereafter. If a stale daemon belongs to another Python interpreter:
 
-`amethystd` treats these as invalidating events:
+```sh
+./tools/amethystctl daemon restart
+```
 
-- device disconnect/reconnect: invalidate device service handles and all process/JIT state;
-- app PID or app-provided `process_generation` change: invalidate JIT, Dyld bypass, JVM, renderer, menu, and world state;
-- bundle build marker change: invalidate runtime/profile assumptions until reprobed;
-- JIT processor/debugserver exit: invalidate JIT/Dyld readiness even if the app process remains alive.
+Do not work around daemon/socket/Python errors with ad-hoc background processes. `doctor` reports the selected Python and short AF_UNIX runtime socket contract.
 
-An install/deploy timeout is `UNKNOWN`, not automatically `FAILED`: query the installed build marker and reconcile before retrying.
+## Candidate workflow
+
+Inspect what the iPad actually has active before changing renderer code:
+
+```sh
+./tools/amethystctl payload inspect --name mithril
+```
+
+Stage a new candidate:
+
+```sh
+./tools/amethystctl payload stage /path/to/libmithril.dylib --name mithril
+./tools/amethystctl payload inspect --name mithril
+```
+
+Return to bundled renderer without deleting immutable staged evidence:
+
+```sh
+./tools/amethystctl payload clear --name mithril
+```
+
+A staged candidate is not considered active merely because the Mac cached its digest. `run smoke` reconciles the iPad active pointer/manifest first and records that device-confirmed digest in the run.
+
+## Required run loop
+
+1. Bootstrap/reuse the supported harness environment and healthy `amethystd`.
+2. `doctor` resolves the exact target device/bundle and transport prerequisites.
+3. Create a unique run ID; evidence never crosses runs.
+4. Launch/reconcile the Amethyst host and observe `process_generation`.
+5. Read the iPad's active candidate pointer/manifest; reconcile candidate digest before profile/JIT work.
+6. Apply deterministic profile/runtime configuration through Agent v2.
+7. Generate a new `game_session_generation` for this Minecraft launch. It changes on every launch even if the Amethyst PID is unchanged.
+8. Attach a fresh or identity-matching UniversalJIT26 processor keyed by host process + game session; request Minecraft launch carrying the same session generation.
+9. Require host RX preparation plus fresh app RW/RX mapping evidence. If unsigned dynamic dylib loading is required, also require keep-attached and both current-session DyldLVBypass proofs.
+10. Require hot-payload runtime provenance: representative EGL/GL symbols must resolve to the exact expected staged image/digest before `renderer_ready` can be accepted.
+11. Advance Minecraft stages only from current-session app/lab events. The MC26.2 Fabric probe, not screenshots/F3, owns `menu_ready`, `world_ready`, and `chunks_stable` semantics.
+12. On failure, auto-collect state, bounded logs, lab/app events, screenshot and crash evidence. Classify the first failing invariant and modify only that layer.
+13. Re-run with a new run ID. After two identical failure fingerprints for the same device-confirmed candidate/profile/target, unchanged retries are blocked.
+14. An intentional third diagnostic repeat must name why it adds evidence:
+
+```sh
+./tools/amethystctl run smoke --profile directmetal-26.2 --target MENU_READY \
+  --allow-repeat-failure --retry-reason 'capture Metal validation after enabling diagnostic X'
+```
+
+15. Once a fix passes its correctness gate, remove one-shot diagnostics, run local/CI regressions, commit/push that accepted change, then choose the next first failing layer.
+16. Performance A/B work starts only after semantic and graphics correctness gates pass.
+
+## Reconciliation and invalidation
+
+- device disconnect/reconnect: invalidate service handles and all process/JIT state;
+- Amethyst PID/`process_generation` change: invalidate all process/session proof;
+- new Minecraft launch: create a new `game_session_generation` and invalidate previous JIT/Dyld/JVM/renderer/menu/world/chunk proof even when PID is unchanged;
+- observed return to launcher: end the current game session and invalidate session-scoped proof;
+- iPad active payload digest change: recompute the attempt identity and retry history;
+- JIT processor/debugserver exit: invalidate JIT/Dyld readiness;
+- install timeout: `UNKNOWN` until installed metadata is reconciled.
 
 ## Retry policy
 
-Transient transport failures may be retried with bounded backoff. Known stale debugserver/E96 state is torn down and recreated on a new local forwarding port. A repeated identical failure signature twice without new evidence must not be blindly retried; reclassify or investigate a new hypothesis.
+Transport failures may use bounded backoff. Known stale debugserver/E96 state is torn down and recreated under the current game session. The retry guard keys the experiment by device-confirmed candidate digest, profile, target and dynamic-dylib requirement, then fingerprints semantic failure text while normalizing volatile PID/port/address values.
 
-Never change renderer code to compensate for a device, signing, transfer, or JIT infrastructure failure.
+Never change renderer code to compensate for a device, signing, transfer, Python, socket or JIT infrastructure failure.
 
 ## User-intervention blockers
 
-Stop and report a blocker only for conditions the host cannot safely resolve unattended, such as:
-
-- physical disconnect that does not recover;
-- device unlock/trust/Developer Mode confirmation;
-- expired/missing provisioning or signing identity;
-- account authentication/2FA interaction;
-- an operation with ambiguous risk to user data;
-- missing local signing material that cannot safely be reconstructed from the repository.
-
-Minecraft crashes, E96/stale debugserver state, process restarts, log collection, renderer crashes, FBO errors, UniversalJIT26 protocol failures, and install-command timeouts are not user blockers by themselves; the harness must classify and collect evidence first.
+Report a user blocker only for conditions the host cannot safely resolve unattended, including persistent physical disconnect, device unlock/trust/Developer Mode confirmation, missing/expired signing material, account authentication/2FA, or operations with ambiguous user-data risk. Minecraft crashes, E96/stale debugserver, process restarts, log collection, renderer failures and install timeouts are diagnostic states, not automatic user blockers.

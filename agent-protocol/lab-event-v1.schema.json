@@ -4,10 +4,11 @@
   "title": "Amethyst Minecraft lab event",
   "type": "object",
   "additionalProperties": true,
-  "required": ["protocol", "run_id", "event_id", "event", "timestamp_ms"],
+  "required": ["protocol", "run_id", "game_session_generation", "event_id", "event", "timestamp_ms"],
   "properties": {
     "protocol": { "const": "amethyst-lab/v1" },
     "run_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
+    "game_session_generation": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
     "event_id": { "type": "string", "minLength": 1, "maxLength": 128 },
     "event": {
       "enum": [
