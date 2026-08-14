@@ -58,7 +58,7 @@ def _is_transient_transport_error(error: BaseException) -> bool:
     """Return True only for transport/session failures that are safe to retry on reads.
 
     Network-paired iOS devices can transiently drop the House Arrest/AFC service
-    while the app and Minecraft process remain healthy.  Read-only operations
+    while the app and Minecraft process remain healthy. Read-only operations
     reopen the service and retry with bounded backoff; semantic/file-contract
     errors are never hidden by this policy.
     """
@@ -172,8 +172,14 @@ class AgentContainerClient:
             try:
                 return await operation()
             except Exception as exc:
-                if not _is_transient_transport_error(exc) or attempt + 1 >= _AFC_READ_ATTEMPTS:
+                transient = _is_transient_transport_error(exc)
+                if not transient:
                     raise
+                if attempt + 1 >= _AFC_READ_ATTEMPTS:
+                    raise TimeoutError(
+                        f"AFC read transport remained unavailable after {_AFC_READ_ATTEMPTS} attempts: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 await asyncio.sleep(_AFC_RETRY_BASE_DELAY * (2**attempt))
         raise AssertionError("unreachable AFC retry state")
 
