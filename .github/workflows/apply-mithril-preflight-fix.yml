@@ -1,0 +1,81 @@
+name: apply-mithril-preflight-fix
+
+on:
+  push:
+    branches: [fix/mithril-ios-candidate-preflight-20260819]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[mithril-preflight-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/mithril-ios-candidate-preflight-20260819
+          fetch-depth: 0
+
+      - name: Integrate fail-closed candidate preflight
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  return
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one anchor, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "tools/amethystd/supervisor.py",
+              "from .model import FailureClass, RunState, Stage\n",
+              "from .model import FailureClass, RunState, Stage\n"
+              "from .mithril_candidate import MithrilCandidateError, inspect_mithril_candidate\n",
+          )
+
+          replace_once(
+              "tools/amethystd/supervisor.py",
+              """        path = Path(local_path).expanduser().resolve()\n        client = AgentContainerClient(self.device_udid, self.bundle_id)\n        manifest = await client.stage_payload(path, name)\n""",
+              """        path = Path(local_path).expanduser().resolve()\n        binary_contract = None\n        if name == \"mithril\":\n            # Reject a wrong-platform/ABI renderer before opening AFC or\n            # mutating the device-active payload pointer. Signature validation\n            # remains in the generic Mach-O staging layer.\n            try:\n                binary_contract = inspect_mithril_candidate(path)\n            except MithrilCandidateError as exc:\n                return {\n                    \"ok\": False,\n                    \"failure\": FailureClass.RUNTIME_ABI_PRECHECK_FAILED.value,\n                    \"detail\": str(exc),\n                }\n        client = AgentContainerClient(self.device_udid, self.bundle_id)\n        manifest = await client.stage_payload(path, name)\n""",
+          )
+
+          replace_once(
+              "tools/amethystd/supervisor.py",
+              """            \"embedded_build_commit\": embedded_commit,\n            \"staged_at\": time(),\n""",
+              """            \"embedded_build_commit\": embedded_commit,\n            \"binary_contract\": binary_contract,\n            \"staged_at\": time(),\n""",
+          )
+
+          for filename in (
+              "docs/agent/mithril-hot-swap.md",
+              "tests/agent/test_mithril_hot_swap.py",
+          ):
+              p = Path(filename)
+              text = p.read_text()
+              text = text.replace("mc26.2-directvulkan", "directmetal-26.2")
+              p.write_text(text)
+
+      - name: Mechanical checks
+        run: |
+          python3 -m compileall -q tools/amethystd tools/amethystctl.py
+          git diff --check
+          ! grep -R "mc26.2-directvulkan" docs/agent/mithril-hot-swap.md tests/agent/test_mithril_hot_swap.py
+          grep -q "RUNTIME_ABI_PRECHECK_FAILED" tools/amethystd/supervisor.py
+
+      - name: Commit integration
+        run: |
+          if git diff --quiet; then
+            echo "Patch already applied"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/amethystd/supervisor.py docs/agent/mithril-hot-swap.md \
+                  tests/agent/test_mithril_hot_swap.py
+          git commit -m "feat: fail closed on invalid Mithril iOS candidate [mithril-preflight-applied]"
+          git push origin HEAD:fix/mithril-ios-candidate-preflight-20260819
