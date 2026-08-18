@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Sequence
 
 from tools.amethystd.mithril_candidate import (
+    MITHRIL_IOS_DEPLOYMENT_TARGET,
     MITHRIL_LIBRARY,
     REQUIRED_EGL_EXPORTS,
     REQUIRED_GL_EXPORTS,
@@ -18,7 +19,12 @@ from tools.amethystd.mithril_candidate import (
 class FakeToolchain:
     def __init__(self) -> None:
         self.archs = "arm64\n"
-        self.build = "Load command 1\n      cmd LC_BUILD_VERSION\n platform IOS\n    minos 16.0\n"
+        self.build = (
+            "Load command 1\n"
+            "      cmd LC_BUILD_VERSION\n"
+            " platform IOS\n"
+            f"    minos {MITHRIL_IOS_DEPLOYMENT_TARGET}\n"
+        )
         self.install_name = f"candidate:\n@rpath/{MITHRIL_LIBRARY}\n"
         self.dependencies = (
             "candidate:\n"
@@ -67,7 +73,7 @@ class MithrilCandidateTests(unittest.TestCase):
             )
         self.assertEqual(result["architectures"], ["arm64"])
         self.assertEqual(result["platform"], "IOS")
-        self.assertEqual(result["minos"], "16.0")
+        self.assertEqual(result["minos"], MITHRIL_IOS_DEPLOYMENT_TARGET)
         self.assertEqual(result["install_name"], f"@rpath/{MITHRIL_LIBRARY}")
         self.assertTrue(result["vulkan_free_dynamic_dependencies"])
         self.assertTrue(result["required_exports_verified"])
@@ -81,6 +87,15 @@ class MithrilCandidateTests(unittest.TestCase):
             toolchain = FakeToolchain()
             toolchain.build = "Load command 1\n platform MACOS\n minos 15.0\n"
             with self.assertRaisesRegex(MithrilCandidateError, "must target iPhoneOS"):
+                inspect_mithril_candidate(
+                    self.candidate(tmp), runner=toolchain.run, tool_finder=toolchain.find
+                )
+
+    def test_wrong_deployment_target_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = FakeToolchain()
+            toolchain.build = "Load command 1\n platform IOS\n minos 18.0\n"
+            with self.assertRaisesRegex(MithrilCandidateError, "deployment target"):
                 inspect_mithril_candidate(
                     self.candidate(tmp), runner=toolchain.run, tool_finder=toolchain.find
                 )
@@ -110,7 +125,9 @@ class MithrilCandidateTests(unittest.TestCase):
         ):
             with self.subTest(dependency=dependency), tempfile.TemporaryDirectory() as tmp:
                 toolchain = FakeToolchain()
-                toolchain.dependencies += f"\t{dependency} (compatibility version 1.0.0, current version 1.0.0)\n"
+                toolchain.dependencies += (
+                    f"\t{dependency} (compatibility version 1.0.0, current version 1.0.0)\n"
+                )
                 with self.assertRaisesRegex(MithrilCandidateError, "Vulkan-free"):
                     inspect_mithril_candidate(
                         self.candidate(tmp),
@@ -142,6 +159,22 @@ class MithrilCandidateTests(unittest.TestCase):
                     self.candidate(tmp), runner=toolchain.run, tool_finder=finder
                 )
             self.assertEqual(toolchain.calls, [])
+
+    def test_tool_execution_error_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = FakeToolchain()
+
+            def broken_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+                raise OSError("tool disappeared")
+
+            with self.assertRaisesRegex(
+                MithrilCandidateError, "could not be executed"
+            ):
+                inspect_mithril_candidate(
+                    self.candidate(tmp),
+                    runner=broken_runner,
+                    tool_finder=toolchain.find,
+                )
 
     def test_wrong_filename_is_rejected_before_tooling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
