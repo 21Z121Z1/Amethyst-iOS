@@ -6,7 +6,7 @@ This workflow replaces `libmithril.dylib` without rebuilding or reinstalling Ame
 
 ```bash
 ./tools/amethystctl mithril swap /absolute/path/to/libmithril.dylib \
-  --profile mc26.2-directvulkan \
+  --profile directmetal-26.2 \
   --target RENDERER_READY
 ```
 
@@ -22,7 +22,7 @@ Undo the latest transition for the currently active digest:
 
 ```bash
 ./tools/amethystctl mithril rollback \
-  --profile mc26.2-directvulkan \
+  --profile directmetal-26.2 \
   --target RENDERER_READY
 ```
 
@@ -31,7 +31,7 @@ An exact staged digest can be selected explicitly:
 ```bash
 ./tools/amethystctl mithril rollback \
   --digest <64-character-sha256> \
-  --profile mc26.2-directvulkan
+  --profile directmetal-26.2
 ```
 
 Use `--digest bundled` to return to the app-bundled Mithril.

@@ -16,6 +16,7 @@ from .container_io import AgentContainerClient
 from .device import DeviceController
 from .jit import JITAttachError, JITSession, JITVerificationError, StaleDebugserverError
 from .model import FailureClass, RunState, Stage
+from .mithril_candidate import MithrilCandidateError, inspect_mithril_candidate
 from .store import StateStore
 
 
@@ -653,6 +654,19 @@ class Supervisor:
                 "detail": "amethystd Python environment lacks pymobiledevice3",
             }
         path = Path(local_path).expanduser().resolve()
+        binary_contract = None
+        if name == "mithril":
+            # Reject a wrong-platform/ABI renderer before opening AFC or
+            # mutating the device-active payload pointer. Signature validation
+            # remains in the generic Mach-O staging layer.
+            try:
+                binary_contract = inspect_mithril_candidate(path)
+            except MithrilCandidateError as exc:
+                return {
+                    "ok": False,
+                    "failure": FailureClass.RUNTIME_ABI_PRECHECK_FAILED.value,
+                    "detail": str(exc),
+                }
         client = AgentContainerClient(self.device_udid, self.bundle_id)
         manifest = await client.stage_payload(path, name)
         embedded_commit = None
@@ -671,6 +685,7 @@ class Supervisor:
             "files": manifest["files"],
             "source_path": str(path),
             "embedded_build_commit": embedded_commit,
+            "binary_contract": binary_contract,
             "staged_at": time(),
         }
         self.store.save_candidate(name, candidate)

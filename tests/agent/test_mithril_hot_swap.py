@@ -230,7 +230,7 @@ class SwapTransactionTests(unittest.TestCase):
             binary.write_bytes(b"candidate")
             daemon = FakeDaemon(old_digest, new_digest)
             manager = MithrilHotSwapManager(store, daemon, FakeLabClient(new_digest))  # type: ignore[arg-type]
-            result = asyncio.run(manager.swap(str(binary), profile="mc26.2-directvulkan"))
+            result = asyncio.run(manager.swap(str(binary), profile="directmetal-26.2"))
             self.assertTrue(result["ok"])
             self.assertEqual(result["before_digest"], old_digest)
             self.assertEqual(result["after_digest"], new_digest)
@@ -251,7 +251,7 @@ class SwapTransactionTests(unittest.TestCase):
             binary.write_bytes(b"candidate")
             daemon = FakeDaemon(old_digest, new_digest, process_generation="old-process")
             manager = MithrilHotSwapManager(store, daemon, FakeLabClient(new_digest))  # type: ignore[arg-type]
-            result = asyncio.run(manager.swap(str(binary), profile="mc26.2-directvulkan"))
+            result = asyncio.run(manager.swap(str(binary), profile="directmetal-26.2"))
             self.assertFalse(result["ok"])
             self.assertEqual(result["smoke"]["failure"], "JIT_VERIFICATION_FAILURE")
             self.assertEqual(result["transaction"]["status"], "failed")
@@ -266,7 +266,7 @@ class SwapTransactionTests(unittest.TestCase):
             daemon = FakeDaemon(old_digest, new_digest)
             manager = MithrilHotSwapManager(store, daemon, FakeLabClient("7" * 64))  # type: ignore[arg-type]
             with self.assertRaisesRegex(RuntimeError, "consumer provenance mismatch"):
-                asyncio.run(manager.swap(str(binary), profile="mc26.2-directvulkan"))
+                asyncio.run(manager.swap(str(binary), profile="directmetal-26.2"))
 
     def test_ledger_default_rollback_target_tracks_transition_not_branch_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
