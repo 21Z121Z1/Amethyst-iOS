@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 MITHRIL_LIBRARY = "libmithril.dylib"
+MITHRIL_IOS_DEPLOYMENT_TARGET = "16.0"
 
 # Natives/ctxbridges/gl_bridge.m resolves these symbols unconditionally before
 # creating the EGL display/context/surface. Keep this list synchronized with the
@@ -93,7 +94,13 @@ def _checked_run(
     tools: dict[str, str],
     runner: CommandRunner,
 ) -> str:
-    result = runner([tools[tool], *arguments])
+    command = [tools[tool], *arguments]
+    try:
+        result = runner(command)
+    except OSError as exc:
+        raise MithrilCandidateError(
+            f"{tool} could not be executed while validating Mithril candidate: {exc}"
+        ) from exc
     if result.returncode != 0:
         detail = "\n".join(
             part.strip() for part in (result.stdout, result.stderr) if part.strip()
@@ -192,6 +199,11 @@ def inspect_mithril_candidate(
     if platform != "IOS":
         raise MithrilCandidateError(
             f"Mithril candidate must target iPhoneOS; LC_BUILD_VERSION platform is {platform}"
+        )
+    if minos != MITHRIL_IOS_DEPLOYMENT_TARGET:
+        raise MithrilCandidateError(
+            "Mithril candidate has the wrong iPhoneOS deployment target: "
+            f"{minos!r}; expected {MITHRIL_IOS_DEPLOYMENT_TARGET!r}"
         )
 
     install_output = _checked_run(
