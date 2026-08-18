@@ -26,7 +26,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 35
     env:
-      MITHRIL_CANDIDATE_SHA: 5e94df04d73a5aa1244d5c737e8c05758247644d
+      MITHRIL_CANDIDATE_SHA: ff87ed0ac97867fdc5d36c6974627e3faea1f43b
     steps:
       - name: Checkout Amethyst preflight under test
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: 21Z121Z1/Mithril-Wrapper
-          ref: 5e94df04d73a5aa1244d5c737e8c05758247644d
+          ref: ff87ed0ac97867fdc5d36c6974627e3faea1f43b
           path: mithril-candidate
           submodules: recursive
           persist-credentials: false
@@ -85,6 +85,7 @@ jobs:
           print(json.dumps(result, indent=2, sort_keys=True))
           assert result["architectures"] == ["arm64"]
           assert result["platform"] == "IOS"
+          assert result["minos"] == "16.0"
           assert result["install_name"] == "@rpath/libmithril.dylib"
           assert result["vulkan_free_dynamic_dependencies"] is True
           assert result["required_exports_verified"] is True
