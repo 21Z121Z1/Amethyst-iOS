@@ -1,0 +1,117 @@
+name: Mithril iPhoneOS candidate integration
+
+on:
+  push:
+    branches: [fix/mithril-ios-candidate-preflight-20260819]
+    paths:
+      - 'tools/amethystd/mithril_candidate.py'
+      - 'tools/amethystd/supervisor.py'
+      - 'tests/agent/test_mithril_candidate.py'
+      - 'tests/agent/test_mithril_supervisor_preflight.py'
+      - '.github/workflows/mithril-ios-candidate-integration.yml'
+  pull_request:
+    paths:
+      - 'tools/amethystd/mithril_candidate.py'
+      - 'tools/amethystd/supervisor.py'
+      - 'tests/agent/test_mithril_candidate.py'
+      - 'tests/agent/test_mithril_supervisor_preflight.py'
+      - '.github/workflows/mithril-ios-candidate-integration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-macho-contract:
+    runs-on: macos-26
+    timeout-minutes: 35
+    env:
+      MITHRIL_CANDIDATE_SHA: a09c8227be9ba599bab0747326f199770f8ebd91
+    steps:
+      - name: Checkout Amethyst preflight under test
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: false
+
+      - name: Checkout exact Mithril DirectMetal candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: 21Z121Z1/Mithril-Wrapper
+          ref: a09c8227be9ba599bab0747326f199770f8ebd91
+          path: mithril-candidate
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Prove source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C mithril-candidate rev-parse HEAD)" = "$MITHRIL_CANDIDATE_SHA"
+          test -z "$(git -C mithril-candidate status --porcelain)"
+
+      - name: Build exact iPhoneOS arm64 DirectMetal dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-mithril-evidence
+          MITHRIL_IOS_BUILD_DIR="$PWD/mithril-build-ios" \
+          MITHRIL_IOS_OUTPUT_DIR="$PWD/mithril-build-ios/artifacts" \
+          MITHRIL_IOS_DEPLOYMENT_TARGET=16.0 \
+            mithril-candidate/scripts/build_iphoneos.sh \
+            2>&1 | tee ci-mithril-evidence/build-iphoneos.log
+          test -s mithril-build-ios/artifacts/libmithril.dylib
+
+      - name: Verify generic staging signature contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          DYLIB="$PWD/mithril-build-ios/artifacts/libmithril.dylib"
+          codesign --force --sign - "$DYLIB"
+          codesign --verify --verbose=2 "$DYLIB"
+          codesign -dvvv "$DYLIB" 2>ci-mithril-evidence/codesign.txt
+          shasum -a 256 "$DYLIB" | tee ci-mithril-evidence/sha256.txt
+
+      - name: Run Amethyst preflight against actual Mach-O
+        shell: bash
+        run: |
+          set -euo pipefail
+          DYLIB="$PWD/mithril-build-ios/artifacts/libmithril.dylib"
+          python3 - "$DYLIB" <<'PY' | tee ci-mithril-evidence/amethyst-preflight.json
+          import json
+          import sys
+          from tools.amethystd.mithril_candidate import inspect_mithril_candidate
+
+          result = inspect_mithril_candidate(sys.argv[1])
+          print(json.dumps(result, indent=2, sort_keys=True))
+          assert result["architectures"] == ["arm64"]
+          assert result["platform"] == "IOS"
+          assert result["minos"] == "16.0"
+          assert result["install_name"] == "@rpath/libmithril.dylib"
+          assert result["vulkan_free_dynamic_dependencies"] is True
+          assert result["required_exports_verified"] is True
+          PY
+
+      - name: Independently record Mach-O contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          DYLIB="$PWD/mithril-build-ios/artifacts/libmithril.dylib"
+          file "$DYLIB" | tee ci-mithril-evidence/file.txt
+          lipo -archs "$DYLIB" | tee ci-mithril-evidence/archs.txt
+          vtool -show-build "$DYLIB" | tee ci-mithril-evidence/build-version.txt
+          otool -D "$DYLIB" | tee ci-mithril-evidence/install-name.txt
+          otool -L "$DYLIB" | tee ci-mithril-evidence/dependencies.txt
+          nm -gUj "$DYLIB" | sort > ci-mithril-evidence/exports.txt
+          ! grep -Eiq 'vulkan|moltenvk' ci-mithril-evidence/dependencies.txt
+          grep -qx '_eglSwapBuffers' ci-mithril-evidence/exports.txt
+          grep -qx '_glCompileShader' ci-mithril-evidence/exports.txt
+          grep -qx '_glDrawElements' ci-mithril-evidence/exports.txt
+
+      - name: Upload cross-repo contract evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mithril-ios-candidate-preflight-evidence
+          retention-days: 14
+          if-no-files-found: error
+          path: ci-mithril-evidence
